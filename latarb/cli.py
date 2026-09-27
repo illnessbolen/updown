@@ -9,6 +9,11 @@
                                            backtest the signal layer (and paper execution) on recorded frames
     python bot.py resolve                  fetch winners for logged windows
     python bot.py analyze [--data DIR]     model calibration, shadow signals, paper results
+    python bot.py stats [--source paper|shadow] [--days N] [--by asset,label,...]
+                                           performance: win rate vs break-even, P&L, drawdown, Sharpe-like
+    python bot.py hypothesis [--alpha 0.05] [--cluster hour]
+                                           is the edge statistically distinguishable from zero?
+    python bot.py report [--days 7]        write the weekly report now (the running bot does it weekly)
     python bot.py price --spot ... --ref ... --tau ... --sigma-bps ...   one-off P(fair)
 
 There is no live-trading command in this version: nothing can send a real order.
@@ -68,6 +73,24 @@ def main(argv=None) -> int:
     sub.add_parser("resolve", help="fetch outcomes for windows seen in the logs")
     an = sub.add_parser("analyze", help="calibration + shadow signal outcomes")
     an.add_argument("--data", default=None, help="directory with signals/snapshots/outcomes (default DATA_DIR)")
+    def add_common(p):
+        p.add_argument("--data", default=None, help="directory with the logs (default DATA_DIR)")
+        p.add_argument("--source", default="auto", choices=("auto", "paper", "shadow"),
+                       help="paper = settled paper positions, shadow = first SIGNAL per window (1 share)")
+        p.add_argument("--days", type=float, default=None, help="only trades settled in the last N days")
+    st = sub.add_parser("stats", help="performance statistics of settled trades")
+    add_common(st)
+    st.add_argument("--by", default="asset,label,kind,price,tau", help="breakdowns: asset,label,side,kind,price,tau")
+    hy = sub.add_parser("hypothesis", help="hypothesis test: is the edge distinguishable from zero?")
+    add_common(hy)
+    hy.add_argument("--alpha", type=float, default=0.05)
+    hy.add_argument("--sims", type=int, default=20000, help="Monte-Carlo simulations under H0")
+    hy.add_argument("--cluster", default="hour", choices=("trade", "window", "hour", "day"),
+                    help="bootstrap cluster (correlated trades are resampled together)")
+    hy.add_argument("--json", action="store_true", help="print the result as JSON")
+    rp2 = sub.add_parser("report", help="write the weekly report now")
+    rp2.add_argument("--data", default=None)
+    rp2.add_argument("--days", type=float, default=7.0)
     pp = sub.add_parser("price", help="evaluate P(fair) for given inputs")
     pp.add_argument("--spot", type=float, required=True)
     pp.add_argument("--ref", type=float, required=True)
@@ -137,6 +160,48 @@ def main(argv=None) -> int:
     if args.cmd == "analyze":
         from .reporting.analyze import run
         run(args.data or cfg.DATA_DIR)
+        return 0
+    if args.cmd in ("stats", "hypothesis"):
+        import time as _time
+
+        from .stats.trades import filter_period, load_trades, paper_start_equity
+        data = args.data or cfg.DATA_DIR
+        trades = load_trades(data, args.source)
+        if args.days:
+            trades = filter_period(trades, since=_time.time() - args.days * 86400)
+        source = trades[0].source if trades else args.source
+        if args.cmd == "stats":
+            from .stats.metrics import BREAKDOWNS, breakdown, compute, format_breakdown, format_metrics
+            unit = "USDC" if source == "paper" else "ед. (1 акция на сигнал)"
+            print(f"=== статистика [{source}] {data} ===")
+            eq = paper_start_equity(data) if source == "paper" else None
+            for line in format_metrics(compute(trades, eq), unit):
+                print(line)
+            for dim in [d.strip() for d in args.by.split(",") if d.strip()]:
+                if dim not in BREAKDOWNS:
+                    print(f"unknown breakdown {dim!r}; choose from {sorted(BREAKDOWNS)}", file=sys.stderr)
+                    return 2
+                if trades:
+                    for line in format_breakdown(dim, breakdown(trades, BREAKDOWNS[dim])):
+                        print(line)
+            return 0
+        from .stats import hypothesis
+        if not 0 < args.alpha < 0.5:
+            print("--alpha must be in (0, 0.5)", file=sys.stderr)
+            return 2
+        res = hypothesis.run(trades, alpha=args.alpha, sims=args.sims, cluster=args.cluster, source=source)
+        if args.json:
+            import json as _json
+            print(_json.dumps(res.to_dict(), ensure_ascii=False, indent=1, default=str))
+        else:
+            for line in res.lines():
+                print(line)
+        return 0
+    if args.cmd == "report":
+        import time as _time
+
+        from .stats.report import write_report
+        print(write_report(args.data or cfg.DATA_DIR, _time.time(), args.days, profile=cfg.RISK_PROFILE))
         return 0
     return 1
 

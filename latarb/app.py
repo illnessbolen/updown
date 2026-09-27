@@ -40,6 +40,7 @@ from .risk.manager import RiskManager
 from .risk.portfolio import Portfolio
 from .scheduler import LoopScheduler, ReplayScheduler, Scheduler
 from .signal.engine import SignalEngine
+from .stats.report import maybe_write_weekly
 
 log = logging.getLogger("latarb.app")
 
@@ -237,6 +238,11 @@ async def run_live(cfg: Settings, mode: str = "shadow", record: bool = False,
         log.log(lvl, "clock vs Binance: %+.1fms (rtt %.0fms, limit %.0fms)", hub.clock_skew_ms, rtt * 1000,
                 cfg.MAX_CLOCK_SKEW_MS)
 
+    async def weekly_job() -> None:
+        path = await asyncio.to_thread(maybe_write_weekly, cfg.DATA_DIR, clock.now(), profile=cfg.RISK_PROFILE)
+        if path:
+            log.info("weekly report written: %s", path)
+
     async def status_job() -> None:
         for line in status_lines(hub, engine, clock.now()):
             log.info(line)
@@ -255,6 +261,7 @@ async def run_live(cfg: Settings, mode: str = "shadow", record: bool = False,
         asyncio.create_task(every(cfg.EVAL_TIMER_S, timer_job, "timer")),
         asyncio.create_task(every(cfg.CLOCK_CHECK_INTERVAL_S, clock_job, "clock")),
         asyncio.create_task(every(cfg.STATUS_INTERVAL_S, status_job, "status")),
+        asyncio.create_task(every(3600.0, weekly_job, "weekly report")),
     ]
     loop = asyncio.get_running_loop()
     for sig in (_signal.SIGINT, _signal.SIGTERM):
