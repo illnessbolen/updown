@@ -145,7 +145,10 @@ def main(argv=None) -> int:
             uvloop.install()
         except ImportError:
             pass
-        asyncio.run(run_live(cfg, args.cmd, record=args.record or cfg.RECORD_TICKS, duration_s=args.duration))
+        try:
+            asyncio.run(run_live(cfg, args.cmd, record=args.record or cfg.RECORD_TICKS, duration_s=args.duration))
+        except KeyboardInterrupt:          # Windows delivers Ctrl+C this way; cleanup already ran in run_live
+            log.info("stopped by Ctrl+C")
         return 0
     if args.cmd == "replay":
         from .app import run_replay

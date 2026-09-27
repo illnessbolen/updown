@@ -20,7 +20,28 @@ Polymarket; если справедливая вероятность исход�
 
 ---
 
-## Быстрый старт
+## Запуск одной командой
+
+Нужен только Python 3.10+. Скачайте/распакуйте папку и в терминале:
+
+```bash
+cd updown-bot
+./start.sh              # Linux / macOS: меню (discover, shadow, paper, analyze, stats, hypothesis, report, test)
+./start.sh paper        # или сразу нужный режим с любыми аргументами bot.py
+```
+
+```bat
+cd updown-bot
+start.bat               :: Windows (cmd): то же меню;  start.bat paper  — сразу режим
+```
+
+При первом запуске скрипт сам создаёт окружение `.venv`, ставит зависимости из
+`requirements.txt` и копирует `.env.example` в `.env` (там меняются настройки). Повторные запуски
+стартуют сразу. `./start.sh test` прогоняет тесты — удобная проверка, что всё установилось.
+Остановка shadow/paper — Ctrl+C; экстренная остановка ордеров — создать файл `STOP` в папке
+(`touch STOP`, в Windows `type nul > STOP`).
+
+## Быстрый старт (вручную)
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
