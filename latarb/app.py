@@ -1,21 +1,26 @@
-"""Run modes of this phase. Neither of them can place an order.
+"""Run modes. None of them can send a real order: execution in this version is paper only.
 
 shadow   live WebSocket feeds + Gamma discovery -> P(fair) -> signals.csv / snapshots / outcomes;
          optional raw tick recording for later replays.
-replay   the same hub + engine driven by recorded frames and a ReplayClock (backtest of the
-         signal layer; outputs go to a separate directory).
+paper    shadow + simulated execution against the live Polymarket books: risk checks, Kelly
+         sizing, pre-trade book refresh, latency budget, maker-first / taker orders, virtual
+         balance, settlement from Gamma outcomes.
+replay   the same hub + engine (+ paper execution with --paper) driven by recorded frames,
+         a ReplayClock and a ReplayScheduler; outputs go to a separate directory.
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
-import math
 import os
 import signal as _signal
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import List, Optional
 
-from .clock import ReplayClock, WallClock
+from .clock import Clock, ReplayClock, WallClock
 from .config import LABEL_SECONDS, Settings
 from .data.feeds import FeedSet
 from .data.gamma import Discovery, GammaClient, fetch_winner
@@ -24,8 +29,16 @@ from .data.markets import MarketWindow, parse_slug
 from .data.parsers import build_parsers, parse_safely
 from .data.recorder import TickRecorder, iter_recording
 from .data.reference import BinanceRest, ReferenceResolver
+from .execution.books import RestBookRefresher, WsBookRefresher
+from .execution.paper import PaperExchange
+from .execution.pipeline import ExecutionPipeline
 from .fastjson import dumps, loads
+from .reporting.exec_log import ExecutionLog
 from .reporting.signal_log import OutcomeTracker, SignalSink
+from .risk.limits import RiskLimits, resolve_limits
+from .risk.manager import RiskManager
+from .risk.portfolio import Portfolio
+from .scheduler import LoopScheduler, ReplayScheduler, Scheduler
 from .signal.engine import SignalEngine
 
 log = logging.getLogger("latarb.app")
@@ -61,8 +74,79 @@ def status_lines(hub: MarketDataHub, engine: SignalEngine, now: float) -> List[s
     return lines
 
 
-# ====================================================================== shadow
-async def run_shadow(cfg: Settings, record: bool = False, duration_s: Optional[float] = None) -> None:
+# ====================================================================== paper stack
+@dataclass
+class PaperStack:
+    limits: RiskLimits
+    portfolio: Portfolio
+    risk: RiskManager
+    exchange: PaperExchange
+    pipeline: ExecutionPipeline
+    log: ExecutionLog
+
+
+def state_path(directory: str) -> str:
+    return os.path.join(directory, "paper_state.json")
+
+
+def reset_paper_state(directory: str) -> Optional[str]:
+    """Move the current paper state aside (never deleted); returns the backup path."""
+    path = state_path(directory)
+    if not os.path.exists(path):
+        return None
+    backup = f"{path}.{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.bak"
+    os.replace(path, backup)
+    return backup
+
+
+def build_paper(cfg: Settings, hub: MarketDataHub, engine: SignalEngine, clock: Clock, scheduler: Scheduler,
+                refresher, out_dir: str, outcomes: OutcomeTracker) -> PaperStack:
+    limits = resolve_limits(cfg)
+    pf = Portfolio.load_or_new(state_path(out_dir), cfg.PAPER_START_USDC)
+    risk = RiskManager(cfg, limits, pf, clock)
+    exchange = PaperExchange(cfg, hub, clock, scheduler)
+    xlog = ExecutionLog(out_dir, clock, cfg.LATENCY_BUDGET_MS)
+    pipe = ExecutionPipeline(cfg, hub, engine, risk, pf, limits, exchange, refresher, clock, xlog)
+    outcomes.listeners.append(pipe.on_outcome)
+    for p in list(pf.positions.values()):
+        winner = outcomes.known_winner(p.slug)
+        if winner:                                   # resolved while we were down
+            pipe.on_outcome(p.slug, winner, clock.now())
+        else:
+            outcomes.track([MarketWindow.from_dict(p.window)])
+    return PaperStack(limits, pf, risk, exchange, pipe, xlog)
+
+
+def paper_preflight(cfg: Settings, st: PaperStack) -> bool:
+    """Mandatory checks before paper trading starts. Returns False to refuse starting."""
+    if os.path.exists(cfg.KILL_SWITCH_FILE):
+        log.critical("kill-switch file %r exists - refusing to start. Delete it to trade.", cfg.KILL_SWITCH_FILE)
+        return False
+    pf = st.portfolio
+    if pf.bankroll <= 0:
+        log.critical("paper bankroll is %.2f - nothing to trade with (use --reset for a new paper account).",
+                     pf.bankroll)
+        return False
+    log.warning("PAPER mode: orders are simulated against live Polymarket books with a virtual balance. "
+                "No real order can be sent by this version.")
+    log.info("paper account: cash %.2f | bankroll %.2f | realized %+.2f | open positions %d | W/L %d/%d",
+             pf.cash, pf.bankroll, pf.realized, len(pf.positions), pf.wins, pf.losses)
+    log.info("risk: %s", st.limits.describe(pf.bankroll))
+    log.info("execution: style=%s budget=%.0fms refresh=%s book_max_age=%.0fms maker_timeout=%.0fms "
+             "fallback=%s min_edge_at_fill=%.3f max_slippage=%.3f fill_delay=%.0fms cooldown=%.0fs "
+             "breaker=%d kill_switch=%s", cfg.EXECUTION_STYLE, cfg.LATENCY_BUDGET_MS, cfg.PRE_TRADE_REFRESH,
+             cfg.BOOK_MAX_AGE_MS, cfg.MAKER_TIMEOUT_MS, cfg.MAKER_FALLBACK_TAKER, cfg.MIN_EDGE_AT_FILL,
+             cfg.MAX_SLIPPAGE, cfg.PAPER_FILL_DELAY_MS, cfg.COOLDOWN_AFTER_LOSS_S, cfg.MAX_CONSECUTIVE_ERRORS,
+             os.path.abspath(cfg.KILL_SWITCH_FILE))
+    if st.risk.daily_stop_hit():
+        log.warning("daily stop is already hit for today (%s): no new orders until the next UTC day", pf.day)
+    return True
+
+
+# ====================================================================== live (shadow / paper)
+async def run_live(cfg: Settings, mode: str = "shadow", record: bool = False,
+                   duration_s: Optional[float] = None) -> None:
+    assert mode in ("shadow", "paper")
     clock = WallClock()
     hub = MarketDataHub(cfg, clock)
     recorder = TickRecorder(os.path.join(cfg.DATA_DIR, "ticks"), cfg.RECORD_ROTATE_S) if record else None
@@ -75,8 +159,18 @@ async def run_shadow(cfg: Settings, record: bool = False, duration_s: Optional[f
     outcomes = OutcomeTracker(cfg, sink)
     feeds = FeedSet(cfg, clock, hub, recorder)
     stop = asyncio.Event()
-
-    log.info("SHADOW mode: live market data, model and signal log only - no orders can be placed.")
+    paper: Optional[PaperStack] = None
+    if mode == "paper":
+        scheduler = LoopScheduler(clock)
+        refresher = (RestBookRefresher(cfg, hub, clock) if cfg.PRE_TRADE_REFRESH == "rest"
+                     else WsBookRefresher(hub, clock, scheduler, cfg.PAPER_REFRESH_LATENCY_MS))
+        paper = build_paper(cfg, hub, engine, clock, scheduler, refresher, cfg.DATA_DIR, outcomes)
+        if not paper_preflight(cfg, paper):
+            sink.close()
+            paper.log.close()
+            return
+    else:
+        log.info("SHADOW mode: live market data, model and signal log only - no orders of any kind.")
     log.info("assets=%s deterministic=%s edge_threshold=%.3f tail_dof=%s data_dir=%s record=%s",
              ",".join(cfg.ASSETS), ",".join(cfg.DETERMINISTIC_LABELS), cfg.EDGE_THRESHOLD, cfg.TAIL_DOF,
              cfg.DATA_DIR, record)
@@ -146,6 +240,9 @@ async def run_shadow(cfg: Settings, record: bool = False, duration_s: Optional[f
     async def status_job() -> None:
         for line in status_lines(hub, engine, clock.now()):
             log.info(line)
+        if paper is not None:
+            log.info("  %s", paper.pipeline.status_line())
+            paper.log.flush()
         sink.flush()
         if recorder is not None:
             recorder.flush()
@@ -181,6 +278,10 @@ async def run_shadow(cfg: Settings, record: bool = False, duration_s: Optional[f
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if paper is not None:
+            paper.exchange.cancel_all("shutdown")
+            log.info("  %s", paper.pipeline.status_line())
+            paper.log.close()
         for line in status_lines(hub, engine, clock.now()):
             log.info(line)
         sink.close()
@@ -188,25 +289,35 @@ async def run_shadow(cfg: Settings, record: bool = False, duration_s: Optional[f
             recorder.close()
 
 
+async def run_shadow(cfg: Settings, record: bool = False, duration_s: Optional[float] = None) -> None:
+    await run_live(cfg, "shadow", record, duration_s)
+
+
 # ====================================================================== replay
-def run_replay(cfg: Settings, paths: List[str], out_dir: str) -> dict:
+def run_replay(cfg: Settings, paths: List[str], out_dir: str, paper: bool = False) -> dict:
+    os.makedirs(out_dir, exist_ok=True)
     clock = ReplayClock()
+    scheduler = ReplayScheduler(clock)
     hub = MarketDataHub(cfg, clock)
     sink = SignalSink(out_dir)
     refs = ReferenceResolver(cfg, hub)
     engine = SignalEngine(cfg, hub, refs, clock, sink)
     outcomes = OutcomeTracker(cfg, sink)
+    stack: Optional[PaperStack] = None
+    if paper:
+        # a backtest has its own fresh account and must not react to the live bot's kill switch
+        cfg = dataclasses.replace(cfg, KILL_SWITCH_FILE=os.path.join(out_dir, "STOP"))
+        reset_paper_state(out_dir)
+        refresher = WsBookRefresher(hub, clock, scheduler, cfg.PAPER_REFRESH_LATENCY_MS)
+        stack = build_paper(cfg, hub, engine, clock, scheduler, refresher, out_dir, outcomes)
     parsers = build_parsers(cfg.BINANCE_SYMBOLS, cfg.COINBASE_PRODUCTS, cfg.CHAINLINK_SYMBOLS)
     frames = bad = 0
     first_ts = last_ts = None
-    next_timer = math.inf
     for ts, src, raw in iter_recording(paths):
         if first_ts is None:
-            first_ts = next_timer = ts
-        while next_timer <= ts:
-            clock.advance_to(next_timer)
-            engine.on_timer()
-            next_timer += cfg.EVAL_TIMER_S
+            first_ts = ts
+            scheduler.every(cfg.EVAL_TIMER_S, engine.on_timer, ts)
+        scheduler.run_until(ts)
         clock.advance_to(ts)
         last_ts = ts
         frames += 1
@@ -231,6 +342,8 @@ def run_replay(cfg: Settings, paths: List[str], out_dir: str) -> dict:
             bad += bool(errs)
             if events:
                 hub.apply_many(events)
+    if last_ts is not None:
+        scheduler.run_until(last_ts + 30.0)           # let in-flight orders finish
     for line in status_lines(hub, engine, clock.now()):
         log.info(line)
     sink.close()
@@ -238,6 +351,13 @@ def run_replay(cfg: Settings, paths: List[str], out_dir: str) -> dict:
     summary = {"frames": frames, "unparseable": bad, "from": first_ts, "to": last_ts,
                "evaluations": s.evaluations, "signals": s.signals, "gated": s.gated,
                "unpriced": dict(s.unpriced), "gates": dict(s.gates), "out_dir": out_dir}
+    if stack is not None:
+        log.info("  %s", stack.pipeline.status_line())
+        stack.log.close()
+        pf = stack.portfolio
+        summary["paper"] = {"cash": pf.cash, "bankroll": pf.bankroll, "realized": pf.realized, "wins": pf.wins,
+                            "losses": pf.losses, "open_positions": len(pf.positions),
+                            "stats": dict(stack.pipeline.stats)}
     log.info("replay done: %s", {k: v for k, v in summary.items() if k not in ("unpriced", "gates")})
     return summary
 

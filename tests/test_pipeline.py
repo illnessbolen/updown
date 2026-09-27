@@ -1,6 +1,5 @@
 """End-to-end: recorded frames -> parsers -> hub -> engine -> CSV -> analysis."""
 import csv
-import math
 
 import pytest
 
@@ -54,7 +53,7 @@ def test_replay_finds_the_stale_book_after_a_spot_jump(tmp_path):
     confirmed = [r for r in sig if float(r["ts"]) >= synthetic.T0 + 200 and r["side"] == "up"][0]
     assert 0 < float(confirmed["ts"]) - float(at_jump[0]["ts"]) <= 0.5
     assert not any("sanity_divergence" in r["reasons"] for r in rows)
-    assert first["oracle_proxy"] == "chainlink" and first["executed"] == "0"
+    assert first["oracle_proxy"] == "chainlink" and first["exec_status"] == ""
     # the reference is the oracle price at the window start, in oracle units
     assert float(first["x_bps"]) > 10
     # every snapshot row of the window has a model probability
@@ -77,7 +76,7 @@ def test_coinbase_divergence_gates_the_whole_window(tmp_path):
 
 
 def test_silent_polymarket_connection_is_stale(tmp_path):
-    synthetic.write_session(tmp_path / "ticks", poly_pongs=False)
+    synthetic.write_session(tmp_path / "ticks", poly_pongs=False, poly_active=False)
     out = tmp_path / "out"
     summary = run_replay(cfg(), [str(tmp_path / "ticks")], str(out))
     assert not [r for r in _signals(out / "signals.csv") if r["decision"] == SIGNAL]

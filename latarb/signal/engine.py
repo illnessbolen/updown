@@ -19,7 +19,10 @@ For each open window:
   5. gates: any failed gate turns a would-be SIGNAL into GATED (still logged:
      that is the material for false-positive / missed-opportunity analysis).
 
-Nothing here places orders. `executed` is always 0 in this phase.
+The engine never places orders itself. In paper mode an ExecutionPipeline is
+attached as `executor`: every SIGNAL is offered to it (its answer is logged as
+exec_status), every evaluation lets it manage resting orders, and it can ask
+for a fresh re-evaluation against a just-refreshed book (`books=`).
 """
 from __future__ import annotations
 
@@ -90,6 +93,9 @@ class Evaluation:
     oracle_age_ms: Optional[float] = None
     book_age_ms: Optional[float] = None
     detect_latency_ms: Optional[float] = None
+    trigger_ts: Optional[float] = None   # receive time of the frame that caused this evaluation
+    signal_id: str = ""
+    exec_status: str = ""                # what the executor did with a SIGNAL (queued / refusal reason)
 
 
 @dataclass
@@ -113,6 +119,7 @@ class SignalEngine:
         self._last_snapshot: Dict[str, float] = {}
         self._blocked_until: Dict[str, float] = {}       # slug -> ts (sanity divergence)
         self._seq = 0
+        self.executor = None                               # set by ExecutionPipeline in paper mode
         hub.spot_listeners.append(self.on_spot)
         hub.book_listeners.append(self.on_book)
 
@@ -131,15 +138,37 @@ class SignalEngine:
             self._run(w, None)
         for slug in [s for s, t in self._blocked_until.items() if t < now]:
             del self._blocked_until[slug]
+        if self.executor is not None:
+            self.executor.on_timer(now)
 
     # ------------------------------------------------------------------ core
+    def _new_signal_id(self, ev: Evaluation) -> str:
+        self._seq += 1
+        return f"{int(ev.ts * 1000)}-{self._seq}"
+
     def _run(self, w: MarketWindow, trigger_ts: Optional[float]) -> None:
         ev = self.evaluate(w, trigger_ts)
         if ev is None:
             return
         self._maybe_snapshot(ev)
+        if self.executor is not None:
+            self.executor.on_evaluation(ev)
+            if ev.decision == SIGNAL:
+                ev.signal_id = self._new_signal_id(ev)
+                ev.exec_status = self.executor.on_signal(ev)
         if ev.decision != NONE:
-            self._maybe_log_signal(ev)
+            self._maybe_log_signal(ev, force=ev.exec_status == "queued")
+
+    def execute_fresh(self, w: MarketWindow, side: str, plan: str) -> str:
+        """Re-detect from scratch (e.g. taker fallback after a maker timeout): a new evaluation on
+        the current book must still say SIGNAL on this side before anything is sent."""
+        ev = self.evaluate(w, self.clock.now())
+        if ev is None or ev.decision != SIGNAL or ev.best.side != side:
+            return "signal_gone"
+        ev.signal_id = self._new_signal_id(ev)
+        ev.exec_status = self.executor.on_signal(ev, plan=plan)
+        self._maybe_log_signal(ev, force=True)
+        return ev.exec_status
 
     def _side(self, name: str, p: float, p_cons: float, book: OrderBook, other: OrderBook,
               rate: float, exponent: float) -> Optional[SideQuote]:
@@ -159,7 +188,10 @@ class SignalEngine:
         return SideQuote(name, px, size, src, bid[0] if bid else None, p, p_cons, fee, cost,
                          p - cost, p_cons - cost)
 
-    def evaluate(self, w: MarketWindow, trigger_ts: Optional[float] = None) -> Optional[Evaluation]:
+    def evaluate(self, w: MarketWindow, trigger_ts: Optional[float] = None,
+                 books: Optional[Tuple[OrderBook, OrderBook]] = None) -> Optional[Evaluation]:
+        """books=(up, down) prices against those books (a fresh REST snapshot before an order)
+        instead of the local WebSocket books."""
         cfg, hub = self.cfg, self.hub
         now = self.clock.now()
         if now < w.start_ts or now >= w.end_ts:
@@ -269,7 +301,7 @@ class SignalEngine:
         # -------- market side
         up = down = best = None
         book_age = None
-        ub, db = hub.books.get(w.up_token), hub.books.get(w.down_token)
+        ub, db = books if books is not None else (hub.books.get(w.up_token), hub.books.get(w.down_token))
         if ub is None or db is None or not (ub.synced and db.synced):
             reasons.append("book_missing")
         else:
@@ -306,7 +338,7 @@ class SignalEngine:
             up=up, down=down, best=best, decision=decision, reasons=tuple(reasons),
             threshold=cfg.EDGE_THRESHOLD, sanity_div_bps=div_bps, spot_age_ms=spot_age * 1000.0,
             oracle_age_ms=None if oracle_age is None or math.isinf(oracle_age) else oracle_age * 1000.0,
-            book_age_ms=book_age, detect_latency_ms=latency)
+            book_age_ms=book_age, detect_latency_ms=latency, trigger_ts=trigger_ts)
 
     # ------------------------------------------------------------------ logging policy
     def _maybe_snapshot(self, ev: Evaluation) -> None:
@@ -317,21 +349,22 @@ class SignalEngine:
             self._last_snapshot[ev.window.slug] = ev.ts
             self.sink.snapshot(ev)
 
-    def _maybe_log_signal(self, ev: Evaluation) -> None:
+    def _maybe_log_signal(self, ev: Evaluation, force: bool = False) -> None:
         key = (ev.window.slug, ev.best.side, ev.decision)
         prev = self._last_logged.get(key)
-        if prev is not None:
+        if prev is not None and not force:
             last_ts, last_edge = prev
             if (ev.ts - last_ts < self.cfg.SIGNAL_RELOG_S
                     and abs(ev.best.edge_cons - last_edge) < self.cfg.SIGNAL_RELOG_EDGE_DELTA):
                 return
         self._last_logged[key] = (ev.ts, ev.best.edge_cons)
-        self._seq += 1
+        if not ev.signal_id:
+            ev.signal_id = self._new_signal_id(ev)
         if ev.decision == SIGNAL:
             self.stats.signals += 1
         else:
             self.stats.gated += 1
-        self.sink.signal(ev, f"{int(ev.ts * 1000)}-{self._seq}")
+        self.sink.signal(ev, ev.signal_id)
 
     def forget(self, live_slugs) -> None:
         for k in [k for k in self._last_logged if k[0] not in live_slugs]:

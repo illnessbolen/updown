@@ -1,13 +1,17 @@
 """Command line.
 
     python bot.py discover                 list currently active Up/Down windows (Gamma)
-    python bot.py shadow [--record]        live feeds -> P(fair) -> signal log (NO orders)
-    python bot.py replay data/ticks        backtest the signal layer on recorded frames
+    python bot.py shadow [--record]        live feeds -> P(fair) -> signal log (no orders at all)
+    python bot.py paper  [--record] [--reset]
+                                           shadow + simulated execution with risk management and a
+                                           virtual balance against the live Polymarket books
+    python bot.py replay data/ticks [--paper]
+                                           backtest the signal layer (and paper execution) on recorded frames
     python bot.py resolve                  fetch winners for logged windows
-    python bot.py analyze [--data DIR]     calibration of P(fair) + shadow signal outcomes
+    python bot.py analyze [--data DIR]     model calibration, shadow signals, paper results
     python bot.py price --spot ... --ref ... --tau ... --sigma-bps ...   one-off P(fair)
 
-Order execution (paper / live) is not part of this phase and has no command.
+There is no live-trading command in this version: nothing can send a real order.
 """
 from __future__ import annotations
 
@@ -46,15 +50,21 @@ def _ts(t: float) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bot.py", description="Polymarket Up/Down latency-arbitrage research bot "
-                                                            "(phase 1: data + P(fair) + signal log, no orders)")
+                                                            "(data, P(fair), signals, paper execution; no live orders)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("discover", help="list active Up/Down windows")
     sp = sub.add_parser("shadow", help="live data, model and signal log; never places orders")
     sp.add_argument("--record", action="store_true", help="also record raw frames to DATA_DIR/ticks")
     sp.add_argument("--duration", type=float, default=None, help="stop after N seconds")
+    pa = sub.add_parser("paper", help="live data + simulated execution with a virtual balance")
+    pa.add_argument("--record", action="store_true", help="also record raw frames to DATA_DIR/ticks")
+    pa.add_argument("--duration", type=float, default=None, help="stop after N seconds")
+    pa.add_argument("--reset", action="store_true",
+                    help="start a new paper account (the old state file is kept as a .bak)")
     rp = sub.add_parser("replay", help="run the signal layer over recorded frames")
     rp.add_argument("paths", nargs="+", help="tick files or directories")
     rp.add_argument("--out", default=None, help="output dir (default DATA_DIR/replay-<utc stamp>)")
+    rp.add_argument("--paper", action="store_true", help="also simulate execution (fresh paper account)")
     sub.add_parser("resolve", help="fetch outcomes for windows seen in the logs")
     an = sub.add_parser("analyze", help="calibration + shadow signal outcomes")
     an.add_argument("--data", default=None, help="directory with signals/snapshots/outcomes (default DATA_DIR)")
@@ -82,7 +92,7 @@ def main(argv=None) -> int:
               f"{'gaussian' if math.isinf(dof) else f't({dof:g})'}")
         return 0
 
-    _setup_logging(cfg.LOG_LEVEL, os.path.join(cfg.DATA_DIR, "logs") if args.cmd == "shadow" else None)
+    _setup_logging(cfg.LOG_LEVEL, os.path.join(cfg.DATA_DIR, "logs") if args.cmd in ("shadow", "paper") else None)
     log = logging.getLogger("latarb")
 
     if args.cmd == "discover":
@@ -94,19 +104,30 @@ def main(argv=None) -> int:
                   f"res={w.resolution:9s} tick={w.tick_size:<6g} fee={w.taker_fee_rate if w.taker_fee_rate is not None else cfg.TAKER_FEE_RATE:<5g} "
                   f"{'CLOSED ' if w.closed else ''}{w.slug}")
         return 0
-    if args.cmd == "shadow":
+    if args.cmd in ("shadow", "paper"):
+        from .app import reset_paper_state, run_live
+        if args.cmd == "paper":
+            from .risk.limits import resolve_limits
+            try:
+                resolve_limits(cfg)                  # refuse to start on out-of-bound risk settings
+            except ConfigError as e:
+                print(f"configuration error: {e}", file=sys.stderr)
+                return 2
+            if args.reset:
+                os.makedirs(cfg.DATA_DIR, exist_ok=True)
+                backup = reset_paper_state(cfg.DATA_DIR)
+                log.warning("paper account reset%s", f"; previous state kept in {backup}" if backup else "")
         try:
             import uvloop  # type: ignore
             uvloop.install()
         except ImportError:
             pass
-        asyncio.run(__import__("latarb.app", fromlist=["run_shadow"]).run_shadow(
-            cfg, record=args.record or cfg.RECORD_TICKS, duration_s=args.duration))
+        asyncio.run(run_live(cfg, args.cmd, record=args.record or cfg.RECORD_TICKS, duration_s=args.duration))
         return 0
     if args.cmd == "replay":
         from .app import run_replay
         out = args.out or os.path.join(cfg.DATA_DIR, "replay-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
-        run_replay(cfg, args.paths, out)
+        run_replay(cfg, args.paths, out, paper=args.paper)
         log.info("replay outputs in %s (python bot.py analyze --data %s)", out, out)
         return 0
     if args.cmd == "resolve":

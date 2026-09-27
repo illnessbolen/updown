@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, Optional, Tuple
 
-from .events import ASK, BID
+from .events import BID
 
 
 class OrderBook:

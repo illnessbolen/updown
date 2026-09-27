@@ -26,7 +26,7 @@ def _book(token, bid, ask, ts):
 
 
 def write_session(directory, *, seed=1, warmup_s=900, jump_at=200.0, jump_bp=25.0,
-                  coinbase_glitch_bp=0.0, poly_pongs=True, sigma=1e-4) -> dict:
+                  coinbase_glitch_bp=0.0, poly_pongs=True, poly_active=True, sigma=1e-4) -> dict:
     """BTC session: vol warm-up, one 5m window, a sharp up-move at T0+jump_at while the
     Polymarket book keeps quoting ~0.50 (the slow repricing the strategy looks for)."""
     rng = random.Random(seed)
@@ -41,7 +41,7 @@ def write_session(directory, *, seed=1, warmup_s=900, jump_at=200.0, jump_bp=25.
     px = 100_000.0
     t = start
     step = 0.2
-    next_cb = next_cl = next_pong = start
+    next_cb = next_cl = next_pong = next_poly = start
     jumped = False
     while t < T0 + DUR - 0.5:
         t = round(t + step, 6)
@@ -65,6 +65,13 @@ def write_session(directory, *, seed=1, warmup_s=900, jump_at=200.0, jump_bp=25.
             rec.write(t + 0.05, "rtds", json.dumps({
                 "topic": "crypto_prices_chainlink", "type": "update", "timestamp": int((t + 0.05) * 1000),
                 "payload": {"symbol": "btc/usd", "timestamp": int(sec * 1000), "value": px * math.exp(3e-4)}}))
+        if poly_active and t >= max(next_poly, T0 - 60):
+            # an active market: deep levels change all the time while the top of book stays stale
+            next_poly = t + 0.5
+            rec.write(t, "polymarket", json.dumps({"event_type": "price_change", "market": "0x1",
+                      "timestamp": str(int(t * 1000)), "price_changes": [
+                          {"asset_id": "UP", "price": "0.30", "size": str(100 + int(t * 10) % 50), "side": "BUY"},
+                          {"asset_id": "DOWN", "price": "0.70", "size": str(100 + int(t * 7) % 50), "side": "SELL"}]}))
         if poly_pongs and t >= next_pong:
             next_pong += 5.0
             rec.write(t, "polymarket", "PONG")

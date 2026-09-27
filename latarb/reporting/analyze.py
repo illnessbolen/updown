@@ -15,8 +15,11 @@ Two independent questions:
    (= average cost per share): buying at 0.97 needs > 97% wins just to break even,
    so a high win rate alone says nothing about profitability.
 
+3. Paper execution (orders.csv x settlements.csv): what was sent vs dropped and
+   why, signal->send latency, fill ratio, realized P&L of settled positions.
+
 The full statistics module (Sharpe, drawdown, binomial / payoff-aware
-hypothesis test) comes with the execution phase; this is the model check.
+hypothesis test, weekly report) is the next phase.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ import glob
 import math
 import os
 import statistics
+from collections import Counter
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .signal_log import read_outcomes
@@ -131,6 +135,46 @@ def shadow_signals(signal_paths: List[str], outcomes: Dict[str, str],
     return res, resolved
 
 
+def _pct(xs: List[float], q: float) -> float:
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * len(xs)))]
+
+
+def paper_results(data_dir: str) -> Optional[dict]:
+    orders_p = os.path.join(data_dir, "orders.csv")
+    sett_p = os.path.join(data_dir, "settlements.csv")
+    if not os.path.exists(orders_p):
+        return None
+    orders = list(_rows([orders_p]))
+    setts = list(_rows([sett_p])) if os.path.exists(sett_p) else []
+    sent = [o for o in orders if o["status"] != "dropped"]
+    lat = [_num(o["latency_ms"]) for o in sent if _num(o.get("latency_ms")) is not None]
+    req = sum(_num(o["shares_req"]) or 0.0 for o in sent)
+    got = sum(_num(o["shares_filled"]) or 0.0 for o in sent)
+    res = {
+        "attempts": len(orders), "sent": len(sent),
+        "sent_by_kind": dict(Counter(o["kind"] for o in sent)),
+        "outcome_by_kind": dict(Counter(f"{o['kind']}:{o['status']}" for o in sent)),
+        "drops": dict(Counter(o["reason"] for o in orders if o["status"] == "dropped")),
+        "fill_ratio": got / req if req else None,
+        "latency_p50": _pct(lat, 0.5) if lat else None, "latency_p95": _pct(lat, 0.95) if lat else None,
+        "latency_max": max(lat) if lat else None, "settled": len(setts),
+    }
+    if setts:
+        pnl = [_num(x["pnl"]) for x in setts]
+        at_risk = [(_num(x["cost"]) or 0.0) + (_num(x["fees"]) or 0.0) for x in setts]
+        shares = [_num(x["shares"]) or 0.0 for x in setts]
+        res.update({
+            "wins": sum(int(x["won"]) for x in setts),
+            "win_rate": statistics.fmean(int(x["won"]) for x in setts),
+            "breakeven_win_rate": sum(at_risk) / sum(shares) if sum(shares) else None,
+            "total_pnl": sum(pnl), "mean_pnl": statistics.fmean(pnl), "median_pnl": statistics.median(pnl),
+            "roi": sum(pnl) / sum(at_risk) if sum(at_risk) else None,
+            "maker_share": sum(_num(x["maker_shares"]) or 0.0 for x in setts) / sum(shares) if sum(shares) else None,
+        })
+    return res
+
+
 def run(data_dir: str, out=print) -> dict:
     outcomes = read_outcomes(os.path.join(data_dir, "outcomes.csv"))
     snaps = sorted(glob.glob(os.path.join(data_dir, "snapshots-*.csv")))
@@ -141,7 +185,7 @@ def run(data_dir: str, out=print) -> dict:
     gated, _ = shadow_signals(sigs, outcomes, "GATED")
 
     out(f"=== model check: {data_dir} | outcomes known for {len(outcomes)} windows ===")
-    out(f"\n-- calibration of P(fair) vs market mid (rows without gate reasons) --")
+    out("\n-- calibration of P(fair) vs market mid (rows without gate reasons) --")
     out(f"rows={cal['rows']} windows={cal['windows']}")
     if "brier_model" in cal:
         out(f"Brier   model {cal['brier_model']:.5f} | market {cal['brier_market']:.5f}  (lower is better)")
@@ -168,11 +212,40 @@ def run(data_dir: str, out=print) -> dict:
         if w:
             out(w)
 
+    paper = paper_results(data_dir)
+    if paper is not None:
+        out("\n-- paper execution (simulated fills against the live book) --")
+        out(f"attempts={paper['attempts']} sent={paper['sent']} by kind={paper['sent_by_kind']} "
+            f"results={paper['outcome_by_kind']}")
+        out(f"dropped before sending: {paper['drops'] or '-'}")
+        if paper["latency_p50"] is not None:
+            out(f"signal->send latency ms: p50 {paper['latency_p50']:.0f} p95 {paper['latency_p95']:.0f} "
+                f"max {paper['latency_max']:.0f} | fill ratio {paper['fill_ratio']:.2%}")
+        if paper["settled"]:
+            out(f"settled positions {paper['settled']}: win rate {paper['win_rate']:.3f} vs break-even "
+                f"{paper['breakeven_win_rate']:.3f} | P&L total {paper['total_pnl']:+.2f} mean {paper['mean_pnl']:+.3f} "
+                f"median {paper['median_pnl']:+.3f} | ROI {paper['roi']:+.2%} | maker share {paper['maker_share']:.0%}")
+        w = sample_warning(paper["settled"], "paper (закрытых позиций)")
+        if w:
+            out(w)
+        out("paper fills are simulated: no queue competition beyond the visible book, no rejects - "
+            "treat the P&L as an upper bound for live results.")
+
     if resolved:
+        orders_by_signal: Dict[str, dict] = {}
+        op = os.path.join(data_dir, "orders.csv")
+        if os.path.exists(op):
+            for o in _rows([op]):
+                orders_by_signal.setdefault(o["signal_id"], o)
+        for r in resolved:
+            o = orders_by_signal.get(r["signal_id"])
+            r["exec_order_status"] = o["status"] if o else ""
+            r["exec_filled_shares"] = o["shares_filled"] if o else ""
+            r["exec_avg_price"] = o["avg_price"] if o else ""
         path = os.path.join(data_dir, "signals_resolved.csv")
         with open(path, "w", newline="", encoding="utf-8") as f:
             wr = csv.DictWriter(f, fieldnames=list(resolved[0].keys()))
             wr.writeheader()
             wr.writerows(resolved)
         out(f"\nper-signal outcomes -> {path}")
-    return {"calibration": cal, "signals": shadow, "gated": gated}
+    return {"calibration": cal, "signals": shadow, "gated": gated, "paper": paper}

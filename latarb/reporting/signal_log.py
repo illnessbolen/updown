@@ -26,7 +26,7 @@ SIGNAL_FIELDS = [
     "sigma_bps", "sigma_lo_bps", "sigma_hi_bps", "oracle_noise_bps", "d", "p_fair_up", "p_fair_up_lo",
     "p_fair_up_hi", "side", "p_fair", "p_fair_cons", "p_market", "ask_src", "ask_size", "bid", "fee",
     "slippage", "cost", "edge", "edge_cons", "threshold", "up_ask", "down_ask", "reasons",
-    "sanity_div_bps", "spot_age_ms", "oracle_age_ms", "book_age_ms", "detect_latency_ms", "executed",
+    "sanity_div_bps", "spot_age_ms", "oracle_age_ms", "book_age_ms", "detect_latency_ms", "exec_status",
 ]
 SNAPSHOT_FIELDS = [
     "ts", "slug", "asset", "label", "resolution", "tau_s", "spot_eff", "reference", "x_bps",
@@ -117,7 +117,7 @@ class SignalSink:
             "reasons": "|".join(ev.reasons), "sanity_div_bps": _f(ev.sanity_div_bps, 3),
             "spot_age_ms": _f(ev.spot_age_ms, 1), "oracle_age_ms": _f(ev.oracle_age_ms, 1),
             "book_age_ms": _f(ev.book_age_ms, 1), "detect_latency_ms": _f(ev.detect_latency_ms, 3),
-            "executed": 0,
+            "exec_status": ev.exec_status,     # queued (see orders.csv) / risk refusal / "" in shadow mode
         }
         self.signals.write(row)
         self.signals.flush()
@@ -128,7 +128,8 @@ class SignalSink:
                      ev.reference, ev.ref_source, ev.x * 1e4, ev.sigma * 1e4, b.p_fair, b.p_fair_cons, b.ask,
                      "*" if b.ask_src == "complement" else "", b.fee, b.edge, b.edge_cons,
                      f" | detect {ev.detect_latency_ms:.2f}ms" if ev.detect_latency_ms is not None else "",
-                     f" | gates: {','.join(ev.reasons)}" if ev.reasons else "")
+                     f" | gates: {','.join(ev.reasons)}" if ev.reasons else
+                     (f" | exec: {ev.exec_status}" if ev.exec_status else ""))
 
     def snapshot(self, ev) -> None:
         day = datetime.fromtimestamp(ev.ts, timezone.utc).strftime("%Y%m%d")
@@ -178,6 +179,7 @@ class OutcomeTracker:
         self.known: Dict[str, str] = read_outcomes(sink.outcomes.path)
         self.pending: Dict[str, object] = {}
         self._next_try: Dict[str, float] = {}
+        self.listeners: list = []            # cb(slug, winner, ts), e.g. paper settlement
 
     def track(self, windows) -> None:
         for w in windows:
@@ -198,9 +200,13 @@ class OutcomeTracker:
         return out
 
     def record(self, w, winner: str, now: float, source: str = "gamma") -> None:
-        if w.slug in self.known:
-            return
-        self.known[w.slug] = winner
-        self.pending.pop(w.slug, None)
-        self._next_try.pop(w.slug, None)
-        self.sink.outcome(w, winner, source, now)
+        if w.slug not in self.known:
+            self.known[w.slug] = winner
+            self.pending.pop(w.slug, None)
+            self._next_try.pop(w.slug, None)
+            self.sink.outcome(w, winner, source, now)
+        for cb in self.listeners:           # idempotent downstream: settling twice is a no-op
+            cb(w.slug, winner, now)
+
+    def known_winner(self, slug: str):
+        return self.known.get(slug)

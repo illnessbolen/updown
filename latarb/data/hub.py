@@ -33,6 +33,7 @@ log = logging.getLogger("latarb.hub")
 
 SpotListener = Callable[[str, float], None]            # (asset, trigger recv_ts)
 BookListener = Callable[[MarketWindow, float], None]   # (window, trigger recv_ts)
+TradeListener = Callable[[LastTrade], None]            # Polymarket prints (paper maker fills)
 
 
 class AssetState:
@@ -70,6 +71,7 @@ class MarketDataHub:
         self.clock_skew_ms: Optional[float] = None
         self.spot_listeners: List[SpotListener] = []
         self.book_listeners: List[BookListener] = []
+        self.trade_listeners: List[TradeListener] = []
         self.counters: Counter = Counter()
 
     # ------------------------------------------------------------------ markets
@@ -150,6 +152,9 @@ class MarketDataHub:
                     log.info("tick size change %s… -> %s", ev.token[:10], ev.tick_size)
             elif kind is LastTrade:
                 self.counters["poly_trades"] += 1
+                if ev.token in self.by_token:
+                    for cb in self.trade_listeners:
+                        cb(ev)
         for asset, ts in spot_touched.items():
             for cb in self.spot_listeners:
                 cb(asset, ts)

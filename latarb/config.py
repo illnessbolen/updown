@@ -127,6 +127,37 @@ class Settings:
     SIGNAL_RELOG_S: float = 5.0
     SIGNAL_RELOG_EDGE_DELTA: float = 0.01
 
+    # ---------------- execution (paper in this version) ----------------
+    EXECUTION_STYLE: str = "maker_first"   # maker_first | taker
+    LATENCY_BUDGET_MS: float = 300.0       # frame received -> order handed to the exchange
+    BOOK_MAX_AGE_MS: float = 1500.0        # never price an order off a book older than this
+    PRE_TRADE_REFRESH: str = "rest"        # rest = GET /book right before sending | ws = local book
+    MAKER_TIMEOUT_MS: float = 2000.0       # resting maker bid lifetime before cancel (+ taker fallback)
+    MAKER_FALLBACK_TAKER: bool = True      # after a maker timeout, cross only on a FRESH signal
+    MAKER_CANCEL_EDGE: float = 0.0         # cancel a resting bid once P_fair_cons - bid drops below this
+    MIN_EDGE_AT_FILL: float = 0.01         # hard floor: never pay a price where P_cons - price - fee < this
+    MAX_SLIPPAGE: float = 0.02             # never pay more than signal ask + this
+    EXEC_RETRY_S: float = 2.0              # pause between attempts on the same window/side
+    ALLOW_BOTH_SIDES: bool = False         # holding Up and Down of one window is a self-inflicted loss
+    MIN_ORDER_USDC: float = 1.0
+    PAPER_START_USDC: float = 1000.0
+    PAPER_REFRESH_LATENCY_MS: float = 60.0  # used when the book refresh is simulated (replay)
+    PAPER_SUBMIT_OVERHEAD_MS: float = 10.0  # order signing + serialization
+    PAPER_FILL_DELAY_MS: float = 120.0      # send -> moment whose local book state our order meets
+    PAPER_LIQUIDITY_MEMORY_S: float = 10.0  # paper fills are remembered so the same quote is not reused
+
+    # ---------------- risk (see latarb/risk/limits.py for profiles and hard bounds) ----------------
+    RISK_PROFILE: str = "conservative"     # conservative | moderate | aggressive
+    # optional overrides of the profile values; 0 = use the profile. Always inside the hard bounds.
+    RISK_BET_PCT: float = 0.0
+    RISK_EXPOSURE_PCT: float = 0.0
+    RISK_DAILY_STOP_PCT: float = 0.0
+    RISK_KELLY_FRACTION: float = 0.0
+    RISK_MAX_FILLS_PER_SIDE: int = 0
+    COOLDOWN_AFTER_LOSS_S: float = 300.0
+    MAX_CONSECUTIVE_ERRORS: int = 5
+    KILL_SWITCH_FILE: str = "STOP"
+
     # ---------------- discovery ----------------
     DISCOVERY_TICK_S: float = 5.0          # deterministic 5m/15m probing cadence
     DISCOVERY_SCAN_INTERVAL_S: float = 120.0
@@ -198,6 +229,21 @@ BOUNDS: Dict[str, Tuple[float, float]] = {
     "EVAL_TIMER_S": (0.05, 60),
     "SIGNAL_RELOG_S": (0.1, 3600),
     "SIGNAL_RELOG_EDGE_DELTA": (0.0, 1.0),
+    "LATENCY_BUDGET_MS": (20, 2000),
+    "BOOK_MAX_AGE_MS": (100, 2000),          # ТЗ: no price older than 1-2 s
+    "MAKER_TIMEOUT_MS": (100, 10000),
+    "MAKER_CANCEL_EDGE": (0.0, 0.5),
+    "MIN_EDGE_AT_FILL": (0.0, 0.5),
+    "MAX_SLIPPAGE": (0.0, 0.1),
+    "EXEC_RETRY_S": (0.1, 600),
+    "MIN_ORDER_USDC": (1.0, 1000),
+    "PAPER_START_USDC": (10, 10_000_000),
+    "PAPER_REFRESH_LATENCY_MS": (0, 2000),
+    "PAPER_SUBMIT_OVERHEAD_MS": (0, 1000),
+    "PAPER_FILL_DELAY_MS": (0, 5000),
+    "PAPER_LIQUIDITY_MEMORY_S": (0, 600),
+    "COOLDOWN_AFTER_LOSS_S": (30, 86400),
+    "MAX_CONSECUTIVE_ERRORS": (1, 20),
     "DISCOVERY_TICK_S": (1, 300),
     "DISCOVERY_SCAN_INTERVAL_S": (60, 300),   # ТЗ: раз в 1-5 минут
     "DISCOVERY_PREFETCH_S": (0, 3600),
@@ -267,6 +313,12 @@ def validate(s: Settings) -> None:
         raise ConfigError("VOL_FAST_HALFLIFE_S must be <= VOL_SLOW_HALFLIFE_S")
     if s.WS_BACKOFF_MIN_S > s.WS_BACKOFF_MAX_S:
         raise ConfigError("WS_BACKOFF_MIN_S must be <= WS_BACKOFF_MAX_S")
+    if s.EXECUTION_STYLE not in ("maker_first", "taker"):
+        raise ConfigError(f"EXECUTION_STYLE={s.EXECUTION_STYLE!r}; expected maker_first or taker")
+    if s.PRE_TRADE_REFRESH not in ("rest", "ws"):
+        raise ConfigError(f"PRE_TRADE_REFRESH={s.PRE_TRADE_REFRESH!r}; expected rest or ws")
+    if not s.KILL_SWITCH_FILE.strip():
+        raise ConfigError("KILL_SWITCH_FILE must not be empty")
     if s.LOG_LEVEL.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ConfigError(f"LOG_LEVEL={s.LOG_LEVEL!r}")
 
