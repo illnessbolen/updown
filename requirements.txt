@@ -1,0 +1,8 @@
+# market data, pricing model, signals, paper execution, statistics (no live order execution)
+websockets>=15.0,<17
+requests>=2.31
+python-dotenv>=1.0
+tzdata>=2024.1            # ZoneInfo("America/New_York") on systems without a tz database (Windows)
+# optional speed-up, picked up automatically when present
+orjson>=3.9; platform_python_implementation == "CPython"
+# not required: uvloop (see USE_UVLOOP); py-clob-client comes with live execution (phase 4)
