@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
 
+import requests
+
 from .clock import Clock, ReplayClock, WallClock
 from .config import LABEL_SECONDS, Settings
 from .data.feeds import FeedSet
@@ -182,6 +184,8 @@ async def run_live(cfg: Settings, mode: str = "shadow", record: bool = False,
                 await fn()
             except asyncio.CancelledError:
                 raise
+            except (requests.RequestException, OSError, asyncio.TimeoutError) as e:
+                log.warning("%s: network error: %s", name, e)       # expected; retried next period
             except Exception as e:  # noqa: BLE001 - a periodic job must survive transient failures
                 log.exception("%s failed: %s", name, e)
             await asyncio.sleep(period)

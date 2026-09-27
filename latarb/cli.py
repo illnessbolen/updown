@@ -140,11 +140,12 @@ def main(argv=None) -> int:
                 os.makedirs(cfg.DATA_DIR, exist_ok=True)
                 backup = reset_paper_state(cfg.DATA_DIR)
                 log.warning("paper account reset%s", f"; previous state kept in {backup}" if backup else "")
-        try:
-            import uvloop  # type: ignore
-            uvloop.install()
-        except ImportError:
-            pass
+        if cfg.USE_UVLOOP:
+            try:
+                import uvloop  # type: ignore
+                uvloop.install()
+            except ImportError:
+                log.warning("USE_UVLOOP=true but uvloop is not installed (pip install uvloop); using asyncio")
         try:
             asyncio.run(run_live(cfg, args.cmd, record=args.record or cfg.RECORD_TICKS, duration_s=args.duration))
         except KeyboardInterrupt:          # Windows delivers Ctrl+C this way; cleanup already ran in run_live

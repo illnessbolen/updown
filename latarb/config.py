@@ -180,6 +180,9 @@ class Settings:
     CLOCK_CHECK_INTERVAL_S: float = 600.0
     STATUS_INTERVAL_S: float = 30.0
     LOG_LEVEL: str = "INFO"
+    # uvloop is optional (pip install uvloop). Off by default: under uvloop, cancelling a WebSocket
+    # that is still connecting (e.g. at shutdown) makes websockets log a harmless but noisy error.
+    USE_UVLOOP: bool = False
 
 
 LABEL_SECONDS: Dict[str, int] = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
