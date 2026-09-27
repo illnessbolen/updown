@@ -1,0 +1,9 @@
+# phase 1: market data, pricing model, signal log (no order execution yet)
+websockets>=15.0,<17
+requests>=2.31
+python-dotenv>=1.0
+tzdata>=2024.1            # ZoneInfo("America/New_York") on systems without a tz database (Windows)
+# optional speed-ups, picked up automatically when present
+orjson>=3.9; platform_python_implementation == "CPython"
+uvloop>=0.19; sys_platform != "win32"
+# py-clob-client is added with the execution phase (see legacy/bot_v7.py)

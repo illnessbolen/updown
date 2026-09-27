@@ -1,0 +1,124 @@
+"""Command line.
+
+    python bot.py discover                 list currently active Up/Down windows (Gamma)
+    python bot.py shadow [--record]        live feeds -> P(fair) -> signal log (NO orders)
+    python bot.py replay data/ticks        backtest the signal layer on recorded frames
+    python bot.py resolve                  fetch winners for logged windows
+    python bot.py analyze [--data DIR]     calibration of P(fair) + shadow signal outcomes
+    python bot.py price --spot ... --ref ... --tau ... --sigma-bps ...   one-off P(fair)
+
+Order execution (paper / live) is not part of this phase and has no command.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import logging.handlers
+import math
+import os
+import sys
+from datetime import datetime, timezone
+
+from .config import ConfigError, load_settings
+
+
+def _setup_logging(level: str, log_dir: str | None) -> None:
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    root = logging.getLogger()
+    root.setLevel(level.upper())
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(fmt)
+    root.addHandler(h)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        fh = logging.handlers.TimedRotatingFileHandler(os.path.join(log_dir, "latarb.log"), when="midnight",
+                                                       backupCount=14, encoding="utf-8", utc=True)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def _ts(t: float) -> str:
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%m-%d %H:%M")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="bot.py", description="Polymarket Up/Down latency-arbitrage research bot "
+                                                            "(phase 1: data + P(fair) + signal log, no orders)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("discover", help="list active Up/Down windows")
+    sp = sub.add_parser("shadow", help="live data, model and signal log; never places orders")
+    sp.add_argument("--record", action="store_true", help="also record raw frames to DATA_DIR/ticks")
+    sp.add_argument("--duration", type=float, default=None, help="stop after N seconds")
+    rp = sub.add_parser("replay", help="run the signal layer over recorded frames")
+    rp.add_argument("paths", nargs="+", help="tick files or directories")
+    rp.add_argument("--out", default=None, help="output dir (default DATA_DIR/replay-<utc stamp>)")
+    sub.add_parser("resolve", help="fetch outcomes for windows seen in the logs")
+    an = sub.add_parser("analyze", help="calibration + shadow signal outcomes")
+    an.add_argument("--data", default=None, help="directory with signals/snapshots/outcomes (default DATA_DIR)")
+    pp = sub.add_parser("price", help="evaluate P(fair) for given inputs")
+    pp.add_argument("--spot", type=float, required=True)
+    pp.add_argument("--ref", type=float, required=True)
+    pp.add_argument("--tau", type=float, required=True, help="seconds to close")
+    pp.add_argument("--sigma-bps", type=float, required=True, help="vol in bp per sqrt(second)")
+    pp.add_argument("--noise-bps", type=float, default=0.0)
+    pp.add_argument("--dof", type=float, default=None, help="Student-t dof (default TAIL_DOF), inf = Gaussian")
+    args = ap.parse_args(argv)
+
+    try:
+        cfg = load_settings()
+    except ConfigError as e:
+        print(f"configuration error: {e}", file=sys.stderr)
+        return 2
+
+    if args.cmd == "price":
+        from .model.pricing import fair_value
+        dof = cfg.TAIL_DOF if args.dof is None else args.dof
+        fv = fair_value(args.spot, args.ref, args.tau, args.sigma_bps * 1e-4, args.noise_bps * 1e-4, dof)
+        print(f"x = {fv.x * 1e4:+.3f} bp | sd = {fv.sd * 1e4:.3f} bp | d = {fv.d:+.4f} | "
+              f"P(up) = {fv.p_up:.6f} | P(down) = {fv.p_down:.6f} | tails: "
+              f"{'gaussian' if math.isinf(dof) else f't({dof:g})'}")
+        return 0
+
+    _setup_logging(cfg.LOG_LEVEL, os.path.join(cfg.DATA_DIR, "logs") if args.cmd == "shadow" else None)
+    log = logging.getLogger("latarb")
+
+    if args.cmd == "discover":
+        from .app import discover_once
+        ws = discover_once(cfg)
+        print(f"{len(ws)} window(s)")
+        for w in ws:
+            print(f"{w.asset:5s} {w.label:4s} {_ts(w.start_ts)} -> {_ts(w.end_ts)} UTC  "
+                  f"res={w.resolution:9s} tick={w.tick_size:<6g} fee={w.taker_fee_rate if w.taker_fee_rate is not None else cfg.TAKER_FEE_RATE:<5g} "
+                  f"{'CLOSED ' if w.closed else ''}{w.slug}")
+        return 0
+    if args.cmd == "shadow":
+        try:
+            import uvloop  # type: ignore
+            uvloop.install()
+        except ImportError:
+            pass
+        asyncio.run(__import__("latarb.app", fromlist=["run_shadow"]).run_shadow(
+            cfg, record=args.record or cfg.RECORD_TICKS, duration_s=args.duration))
+        return 0
+    if args.cmd == "replay":
+        from .app import run_replay
+        out = args.out or os.path.join(cfg.DATA_DIR, "replay-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+        run_replay(cfg, args.paths, out)
+        log.info("replay outputs in %s (python bot.py analyze --data %s)", out, out)
+        return 0
+    if args.cmd == "resolve":
+        from .app import resolve_outcomes
+        log.info("resolved %d window(s)", resolve_outcomes(cfg))
+        return 0
+    if args.cmd == "analyze":
+        from .reporting.analyze import run
+        run(args.data or cfg.DATA_DIR)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
