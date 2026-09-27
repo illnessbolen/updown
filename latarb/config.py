@@ -111,6 +111,11 @@ class Settings:
     VOL_FAST_HORIZON_S: float = 120.0      # weight of fast vol = exp(-tau / horizon)
     SIGMA_UNCERTAINTY: float = 0.20        # +-20% band around the sigma range for conservative edge
     TAIL_DOF: float = 5.0                  # Student-t tails; "inf" = Gaussian
+    # longer sampling scales (seconds) for horizon-matched vol; a window with tau left is priced
+    # with the longest scale <= tau, and the conservative band spans every scale
+    VOL_SCALES_S: Tuple[str, ...] = ("10", "60")
+    VOL_SCALE_HALFLIFE_S: float = 3600.0
+    VOL_SCALE_MIN_OBS: int = 20            # returns needed at a scale before it is used (60 s -> 20 min)
 
     # ---------------- signal ----------------
     EDGE_THRESHOLD: float = 0.03           # min conservative edge (prob. points) after fee+slippage
@@ -122,6 +127,13 @@ class Settings:
     MIN_ASK: float = 0.01
     MAX_ASK: float = 0.99
     USE_COMPLEMENT_BOOK: bool = True       # buy Down ~ sell Up: ask_down_eff = min(ask_down, 1 - bid_up)
+    # Latency check: a signal must be explained by a RECENT spot move the market has not priced yet,
+    # i.e. the market mid must match what our model said LATENCY_LOOKBACKS_S seconds ago (within
+    # LATENCY_MATCH_TOL). If the market disagrees with our model in general (vol, reference, or it is
+    # simply ahead of our feed) the "edge" is not latency and the signal is gated (edge_not_latency).
+    REQUIRE_LATENCY_EXPLANATION: bool = True
+    LATENCY_LOOKBACKS_S: Tuple[str, ...] = ("1", "2", "3", "5")
+    LATENCY_MATCH_TOL: float = 0.04
     MAX_CLOCK_SKEW_MS: float = 250.0
     EVAL_TIMER_S: float = 1.0
     SIGNAL_RELOG_S: float = 5.0
@@ -220,6 +232,9 @@ BOUNDS: Dict[str, Tuple[float, float]] = {
     "VOL_FAST_HORIZON_S": (1, 86400),
     "SIGMA_UNCERTAINTY": (0.0, 0.9),
     "TAIL_DOF": (2.5, math.inf),
+    "VOL_SCALE_HALFLIFE_S": (60, 7 * 86400),
+    "VOL_SCALE_MIN_OBS": (5, 100000),
+    "LATENCY_MATCH_TOL": (0.005, 0.5),
     "EDGE_THRESHOLD": (0.005, 0.5),
     "EXPECTED_SLIPPAGE": (0.0, 0.1),
     "TAKER_FEE_RATE": (0.0, 1.0),
@@ -310,6 +325,13 @@ def validate(s: Settings) -> None:
     bad = [l for l in s.DETERMINISTIC_LABELS if l not in LABEL_SECONDS]
     if bad:
         raise ConfigError(f"DETERMINISTIC_LABELS: unknown {bad}; known: {tuple(LABEL_SECONDS)}")
+    for name in ("VOL_SCALES_S", "LATENCY_LOOKBACKS_S"):
+        try:
+            vals = [float(x) for x in getattr(s, name)]
+        except ValueError as e:
+            raise ConfigError(f"{name}: expected comma-separated numbers") from e
+        if any(v <= 0 or v > 3600 for v in vals):
+            raise ConfigError(f"{name}: values must be in (0, 3600] seconds")
     if s.MIN_ASK >= s.MAX_ASK:
         raise ConfigError("MIN_ASK must be < MAX_ASK")
     if s.VOL_FAST_HALFLIFE_S > s.VOL_SLOW_HALFLIFE_S:

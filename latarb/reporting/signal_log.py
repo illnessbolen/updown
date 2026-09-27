@@ -27,11 +27,13 @@ SIGNAL_FIELDS = [
     "p_fair_up_hi", "side", "p_fair", "p_fair_cons", "p_market", "ask_src", "ask_size", "bid", "fee",
     "slippage", "cost", "edge", "edge_cons", "threshold", "up_ask", "down_ask", "reasons",
     "sanity_div_bps", "spot_age_ms", "oracle_age_ms", "book_age_ms", "detect_latency_ms", "exec_status",
+    "vol_scale_s", "mkt_mid_up", "sigma_implied_bps", "x_implied_bps", "lag_match_err", "lag_match_s",
 ]
 SNAPSHOT_FIELDS = [
     "ts", "slug", "asset", "label", "resolution", "tau_s", "spot_eff", "reference", "x_bps",
     "sigma_bps", "oracle_noise_bps", "d", "p_fair_up", "p_fair_up_lo", "p_fair_up_hi",
     "up_bid", "up_ask", "down_bid", "down_ask", "best_side", "best_edge_cons", "reasons",
+    "vol_scale_s", "mkt_mid_up", "sigma_implied_bps", "x_implied_bps", "lag_match_err", "lag_match_s",
 ]
 OUTCOME_FIELDS = ["slug", "asset", "label", "window_start", "window_end", "winner", "source", "resolved_ts"]
 
@@ -73,6 +75,13 @@ class CsvAppender:
 
     def close(self) -> None:
         self._fh.close()
+
+
+def _diag(ev) -> dict:
+    return {"vol_scale_s": _f(ev.vol_scale_s, 3), "mkt_mid_up": _f(ev.mkt_mid_up, 4),
+            "sigma_implied_bps": _f(ev.sigma_implied * 1e4, 4) if ev.sigma_implied is not None else "",
+            "x_implied_bps": _f(ev.x_implied * 1e4, 4) if ev.x_implied is not None else "",
+            "lag_match_err": _f(ev.lag_err, 4), "lag_match_s": _f(ev.lag_s, 3)}
 
 
 def read_outcomes(path: str) -> Dict[str, str]:
@@ -118,15 +127,19 @@ class SignalSink:
             "spot_age_ms": _f(ev.spot_age_ms, 1), "oracle_age_ms": _f(ev.oracle_age_ms, 1),
             "book_age_ms": _f(ev.book_age_ms, 1), "detect_latency_ms": _f(ev.detect_latency_ms, 3),
             "exec_status": ev.exec_status,     # queued (see orders.csv) / risk refusal / "" in shadow mode
+            **_diag(ev),
         }
         self.signals.write(row)
         self.signals.flush()
         if self.echo:
-            log.info("%s %s %s %s buy %s | %.1fs left | S=%.8g K=%.8g (%s) x=%+.2fbp sigma=%.3fbp/s^0.5 | "
-                     "P_fair=%.4f [cons %.4f] vs ask %.3f%s fee %.4f | edge %+.4f (cons %+.4f)%s%s",
+            mkt_sig = "-" if ev.sigma_implied is None else f"{ev.sigma_implied * 1e4:.3f}"
+            lag = "-" if ev.lag_err is None else f"{ev.lag_err:.3f}@{ev.lag_s:g}s"
+            log.info("%s %s %s %s buy %s | %.1fs left | S=%.8g K=%.8g (%s) x=%+.2fbp sigma=%.3fbp/s^0.5@%gs "
+                     "(mkt %s) | P_fair=%.4f [cons %.4f] vs ask %.3f%s fee %.4f | edge %+.4f (cons %+.4f) "
+                     "| lag match %s%s%s",
                      ev.decision, w.asset.upper(), w.label, w.slug, b.side.upper(), ev.tau_s, ev.spot_eff,
-                     ev.reference, ev.ref_source, ev.x * 1e4, ev.sigma * 1e4, b.p_fair, b.p_fair_cons, b.ask,
-                     "*" if b.ask_src == "complement" else "", b.fee, b.edge, b.edge_cons,
+                     ev.reference, ev.ref_source, ev.x * 1e4, ev.sigma * 1e4, ev.vol_scale_s, mkt_sig, b.p_fair,
+                     b.p_fair_cons, b.ask, "*" if b.ask_src == "complement" else "", b.fee, b.edge, b.edge_cons, lag,
                      f" | detect {ev.detect_latency_ms:.2f}ms" if ev.detect_latency_ms is not None else "",
                      f" | gates: {','.join(ev.reasons)}" if ev.reasons else
                      (f" | exec: {ev.exec_status}" if ev.exec_status else ""))
@@ -149,6 +162,7 @@ class SignalSink:
             "down_bid": _f(ev.down.bid) if ev.down else "", "down_ask": _f(ev.down.ask) if ev.down else "",
             "best_side": ev.best.side if ev.best else "",
             "best_edge_cons": _f(ev.best.edge_cons) if ev.best else "", "reasons": "|".join(ev.reasons),
+            **_diag(ev),
         })
 
     def outcome(self, w, winner: str, source: str, ts: float) -> None:

@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 from .distributions import std_t_cdf
 
@@ -85,3 +85,49 @@ def fair_value_band(spot: float, reference: float, tau_s: float, sigmas: Iterabl
     if not ps:
         raise ValueError("need at least one sigma")
     return min(ps), max(ps)
+
+
+# ---------------------------------------------------------------- market-implied inputs
+def implied_sigma(spot: float, reference: float, tau_s: float, p_up_market: float, oracle_noise: float = 0.0,
+                  tail_dof: float = math.inf, sigma_max: float = 1e-2) -> Optional[float]:
+    """Volatility (per sqrt second) at which the model reproduces the market's P(up), given OUR spot
+    and reference. None when no sigma can (|x| ~ 0, or the market is on the other side of 0.5 from
+    x: then the market disagrees about where the price is, not about vol)."""
+    if tau_s <= 0 or not 0.0 < p_up_market < 1.0:
+        return None
+    x = math.log(spot / reference)
+    if abs(x) < 1e-7:
+        return None
+    f = lambda s: fair_value(spot, reference, tau_s, s, oracle_noise, tail_dof).p_up - p_up_market  # noqa: E731
+    lo, hi = 1e-9, sigma_max
+    flo, fhi = f(lo), f(hi)
+    if flo == 0.0:
+        return lo
+    if flo * fhi > 0:
+        return None
+    for _ in range(50):
+        mid = math.sqrt(lo * hi)                      # geometric bisection: sigma spans decades
+        fm = f(mid)
+        if (fm > 0) == (flo > 0):
+            lo, flo = mid, fm
+        else:
+            hi = mid
+    return math.sqrt(lo * hi)
+
+
+def implied_log_moneyness(tau_s: float, sigma: float, p_up_market: float, oracle_noise: float = 0.0,
+                          tail_dof: float = math.inf) -> Optional[float]:
+    """ln(S/K) at which the model (with OUR sigma) reproduces the market's P(up)."""
+    if not 0.0 < p_up_market < 1.0 or (sigma <= 0 and oracle_noise <= 0) or tau_s < 0:
+        return None
+    f = lambda x: fair_value(math.exp(x), 1.0, tau_s, sigma, oracle_noise, tail_dof).p_up - p_up_market  # noqa: E731
+    lo, hi = -0.5, 0.5
+    if f(lo) > 0 or f(hi) < 0:
+        return None
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if f(mid) < 0:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)

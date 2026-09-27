@@ -23,7 +23,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 from ..clock import Clock
 from ..config import Settings
 from ..model.basis import BasisTracker
-from ..model.volatility import RealizedVol
+from ..model.volatility import MultiScaleVol, RealizedVol
 from .events import BookLevel, BookSnapshot, LastTrade, OracleTick, SpotQuote, SpotTrade, TickSizeChange
 from .markets import MarketWindow
 from .orderbook import OrderBook
@@ -46,8 +46,11 @@ class AssetState:
         self.oracle: Optional[OracleTick] = None
         self.fast_hist = TimeSeries(cfg.FAST_HISTORY_S)
         self.oracle_hist = TimeSeries(cfg.ORACLE_HISTORY_S)
-        self.vol = RealizedVol(cfg.VOL_SAMPLE_S, cfg.VOL_FAST_HALFLIFE_S, cfg.VOL_SLOW_HALFLIFE_S,
-                               cfg.VOL_MIN_SAMPLES, cfg.VOL_MAX_GAP_S)
+        self.vol = MultiScaleVol(
+            RealizedVol(cfg.VOL_SAMPLE_S, cfg.VOL_FAST_HALFLIFE_S, cfg.VOL_SLOW_HALFLIFE_S,
+                        cfg.VOL_MIN_SAMPLES, cfg.VOL_MAX_GAP_S),
+            tuple(sorted(float(x) for x in cfg.VOL_SCALES_S)), cfg.VOL_SCALE_HALFLIFE_S,
+            cfg.VOL_SCALE_MIN_OBS, cfg.VOL_MAX_GAP_S)
         self.sanity_basis = BasisTracker(cfg.BASIS_HALFLIFE_S, cfg.BASIS_MIN_SAMPLES)
         self.oracle_basis = BasisTracker(cfg.ORACLE_BASIS_HALFLIFE_S, cfg.BASIS_MIN_SAMPLES)
         self.first_trades: Dict[int, Tuple[float, bool]] = {}   # minute start -> (price, certain)

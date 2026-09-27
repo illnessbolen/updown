@@ -8,9 +8,11 @@ import random
 
 from latarb.data.markets import CHAINLINK, MarketWindow
 from latarb.data.recorder import TickRecorder
+from latarb.model.distributions import norm_cdf
 
 T0 = 1_790_000_000          # window start (multiple of 300)
 DUR = 300
+JUMP_AT = 30.0              # seconds into the window; early, while the market is still near 0.5
 
 
 def window() -> MarketWindow:
@@ -25,10 +27,12 @@ def _book(token, bid, ask, ts):
                         "asks": [{"price": f"{ask:.2f}", "size": "500"}]}])
 
 
-def write_session(directory, *, seed=1, warmup_s=900, jump_at=200.0, jump_bp=25.0,
+def write_session(directory, *, seed=1, warmup_s=1500, jump_at=JUMP_AT, jump_bp=25.0,
                   coinbase_glitch_bp=0.0, poly_pongs=True, poly_active=True, sigma=1e-4) -> dict:
-    """BTC session: vol warm-up, one 5m window, a sharp up-move at T0+jump_at while the
-    Polymarket book keeps quoting ~0.50 (the slow repricing the strategy looks for)."""
+    """BTC session: vol warm-up, one 5m window. While the window runs, the Polymarket book tracks
+    the true fair value (an efficient market); at T0+jump_at spot jumps and the book FREEZES at its
+    pre-jump quote — the slow repricing the strategy looks for. With poly_active=False the book
+    never moves after its first snapshot (a dead market)."""
     rng = random.Random(seed)
     rec = TickRecorder(str(directory), rotate_s=3600)
     w = window()
@@ -43,6 +47,7 @@ def write_session(directory, *, seed=1, warmup_s=900, jump_at=200.0, jump_bp=25.
     step = 0.2
     next_cb = next_cl = next_pong = next_poly = start
     jumped = False
+    k_ref = None
     while t < T0 + DUR - 0.5:
         t = round(t + step, 6)
         px *= math.exp(rng.gauss(0.0, sigma * math.sqrt(step)))
@@ -62,12 +67,21 @@ def write_session(directory, *, seed=1, warmup_s=900, jump_at=200.0, jump_bp=25.
         if t >= next_cl:
             sec = math.ceil(t)
             next_cl = sec + 1.0
+            if sec == T0:
+                k_ref = px * math.exp(3e-4)
             rec.write(t + 0.05, "rtds", json.dumps({
                 "topic": "crypto_prices_chainlink", "type": "update", "timestamp": int((t + 0.05) * 1000),
                 "payload": {"symbol": "btc/usd", "timestamp": int(sec * 1000), "value": px * math.exp(3e-4)}}))
         if poly_active and t >= max(next_poly, T0 - 60):
-            # an active market: deep levels change all the time while the top of book stays stale
+            # an active market: deep levels change all the time
             next_poly = t + 0.5
+            if k_ref is not None and not (jumped and jump_bp):
+                # efficient market until the jump: top of book around the true (Gaussian) fair value
+                x = math.log(px * math.exp(3e-4) / k_ref)
+                p_up = norm_cdf(x / (sigma * math.sqrt(T0 + DUR - t)))
+                m = min(max(round(p_up, 2), 0.03), 0.97)
+                rec.write(t, "polymarket", _book("UP", m - 0.01, m + 0.01, t))
+                rec.write(t, "polymarket", _book("DOWN", 1 - m - 0.01, 1 - m + 0.01, t))
             rec.write(t, "polymarket", json.dumps({"event_type": "price_change", "market": "0x1",
                       "timestamp": str(int(t * 1000)), "price_changes": [
                           {"asset_id": "UP", "price": "0.30", "size": str(100 + int(t * 10) % 50), "side": "BUY"},

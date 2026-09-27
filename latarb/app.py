@@ -62,9 +62,10 @@ def status_lines(hub: MarketDataHub, engine: SignalEngine, now: float) -> List[s
             lines.append(f"  {a}: no Binance quote yet")
             continue
         sg = st.vol.sigmas()
+        scales = " ".join(f"{k:g}s {_bp(v)}" for k, v in sorted(st.vol.scale_sigmas().items()) if k > 1)
         lines.append(
-            f"  {a}: mid {st.fast.mid:.8g} age {now - st.fast.recv_ts:.1f}s | sigma fast/slow "
-            f"{_bp(sg[0]) if sg else '-'}/{_bp(sg[1]) if sg else '-'} bp/s^0.5 "
+            f"  {a}: mid {st.fast.mid:.8g} age {now - st.fast.recv_ts:.1f}s | sigma bp/s^0.5 1s fast/slow "
+            f"{_bp(sg[0]) if sg else '-'}/{_bp(sg[1]) if sg else '-'} {scales} "
             f"({st.vol.samples}/{st.vol.min_samples}) | oracle basis {_bp(st.oracle_basis.mean)}"
             f"±{_bp(st.oracle_basis.std)}bp n={st.oracle_basis.n} | cb basis {_bp(st.sanity_basis.mean)}"
             f"±{_bp(st.sanity_basis.std)}bp | trade lag "

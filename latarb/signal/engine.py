@@ -39,7 +39,7 @@ from ..data.markets import BINANCE, CHAINLINK, MarketWindow
 from ..data.orderbook import OrderBook
 from ..data.reference import ReferenceResolver
 from ..model.fees import taker_fee_per_share
-from ..model.pricing import fair_value, fair_value_band
+from ..model.pricing import fair_value, fair_value_band, implied_log_moneyness, implied_sigma
 
 log = logging.getLogger("latarb.signal")
 
@@ -96,6 +96,28 @@ class Evaluation:
     trigger_ts: Optional[float] = None   # receive time of the frame that caused this evaluation
     signal_id: str = ""
     exec_status: str = ""                # what the executor did with a SIGNAL (queued / refusal reason)
+    vol_scale_s: float = 1.0             # sampling scale the point sigma comes from
+    conv: float = 1.0                    # spot_eff / Binance mid (resolution-unit conversion)
+    mkt_mid_up: Optional[float] = None   # market's P(up): mid of the Up book incl. the complement
+    mkt_half_spread: Optional[float] = None
+    lag_err: Optional[float] = None      # |P_model(t - lag) - market mid|, best over the lookbacks
+    lag_s: Optional[float] = None        # the lookback that matched best (0 = now)
+    sigma_implied: Optional[float] = None  # sigma at which our model reproduces the market mid
+    x_implied: Optional[float] = None      # ln(S/K) the market mid implies under our sigma
+
+
+def market_mid_up(ub: OrderBook, db: OrderBook) -> Optional[Tuple[float, float]]:
+    """(mid, half spread) of the market's P(up), taking the complement book into account:
+    bid_up = max(bid Up, 1 - ask Down), ask_up = min(ask Up, 1 - bid Down)."""
+    ub_b, ub_a, db_b, db_a = ub.best_bid(), ub.best_ask(), db.best_bid(), db.best_ask()
+    bids = [p for p in ((ub_b[0] if ub_b else None), (1.0 - db_a[0] if db_a else None)) if p is not None]
+    asks = [p for p in ((ub_a[0] if ub_a else None), (1.0 - db_b[0] if db_b else None)) if p is not None]
+    if not bids or not asks:
+        return None
+    bid, ask = max(bids), min(asks)
+    if not 0.0 < bid <= ask < 1.0:
+        return None
+    return 0.5 * (bid + ask), 0.5 * (ask - bid)
 
 
 @dataclass
@@ -120,6 +142,7 @@ class SignalEngine:
         self._blocked_until: Dict[str, float] = {}       # slug -> ts (sanity divergence)
         self._seq = 0
         self.executor = None                               # set by ExecutionPipeline in paper mode
+        self._lookbacks = tuple(sorted(float(x) for x in cfg.LATENCY_LOOKBACKS_S))
         hub.spot_listeners.append(self.on_spot)
         hub.book_listeners.append(self.on_book)
 
@@ -208,12 +231,9 @@ class SignalEngine:
         if ref is None:
             self.stats.unpriced[why] += 1
             return None
-        if not st.vol.ready:
-            self.stats.unpriced["vol_warmup"] += 1
-            return None
-        band = st.vol.sigma_band(tau, cfg.VOL_FAST_HORIZON_S, cfg.SIGMA_UNCERTAINTY)
-        if band is None:
-            self.stats.unpriced["vol_warmup"] += 1
+        vol, why = st.vol.estimate(tau, cfg.VOL_FAST_HORIZON_S, cfg.SIGMA_UNCERTAINTY)
+        if vol is None:
+            self.stats.unpriced[why] += 1
             return None
         self.stats.evaluations += 1
         reasons = []
@@ -293,14 +313,16 @@ class SignalEngine:
         if w.closed or not w.accepting_orders:
             reasons.append("market_closed")
 
-        # -------- fair value
-        lo, sig, hi = band
+        # -------- fair value (sigma from the sampling scale closest to the horizon)
+        lo, sig, hi = vol.lo, vol.point, vol.hi
         fv = fair_value(spot_eff, ref.price, tau, sig, noise, cfg.TAIL_DOF)
         p_lo, p_hi = fair_value_band(spot_eff, ref.price, tau, (lo, sig, hi), noise, cfg.TAIL_DOF)
 
         # -------- market side
         up = down = best = None
         book_age = None
+        mkt = None
+        lag_err = lag_s = None
         ub, db = books if books is not None else (hub.books.get(w.up_token), hub.books.get(w.down_token))
         if ub is None or db is None or not (ub.synced and db.synced):
             reasons.append("book_missing")
@@ -321,6 +343,15 @@ class SignalEngine:
                 reasons.append("no_ask")
             else:
                 reasons.append("ask_out_of_range")
+            mkt = market_mid_up(ub, db)
+            # Latency thesis check: the market must look like OUR model a moment ago. If it matches no
+            # recent version of the model, it disagrees with the model itself (vol, reference, or it is
+            # ahead of our feed) and the "edge" is not a latency effect.
+            if (cfg.REQUIRE_LATENCY_EXPLANATION and mkt is not None and best is not None
+                    and best.edge_cons >= cfg.EDGE_THRESHOLD):
+                lag_err, lag_s = self._lag_match(st, now, spot_eff / mid, ref.price, tau, sig, noise, fv.p_up, mkt[0])
+                if lag_err is not None and lag_err > max(cfg.LATENCY_MATCH_TOL, mkt[1]):
+                    reasons.append("edge_not_latency")
 
         if best is not None and best.edge_cons >= cfg.EDGE_THRESHOLD:
             decision = GATED if reasons else SIGNAL
@@ -338,7 +369,36 @@ class SignalEngine:
             up=up, down=down, best=best, decision=decision, reasons=tuple(reasons),
             threshold=cfg.EDGE_THRESHOLD, sanity_div_bps=div_bps, spot_age_ms=spot_age * 1000.0,
             oracle_age_ms=None if oracle_age is None or math.isinf(oracle_age) else oracle_age * 1000.0,
-            book_age_ms=book_age, detect_latency_ms=latency, trigger_ts=trigger_ts)
+            book_age_ms=book_age, detect_latency_ms=latency, trigger_ts=trigger_ts, vol_scale_s=vol.scale_s,
+            conv=spot_eff / mid, mkt_mid_up=mkt[0] if mkt else None, mkt_half_spread=mkt[1] if mkt else None,
+            lag_err=lag_err, lag_s=lag_s)
+
+    def _lag_match(self, st, now: float, conv: float, reference: float, tau: float, sigma: float, noise: float,
+                   p_now: float, mkt_up: float) -> Tuple[Optional[float], Optional[float]]:
+        """Smallest |P_model(t - lag) - market mid| over lag in {0} + LATENCY_LOOKBACKS_S."""
+        best_err, best_lag = abs(p_now - mkt_up), 0.0
+        for lag in self._lookbacks:
+            hit = st.fast_hist.at(now - lag)
+            if hit is None:
+                continue
+            p = fair_value(hit[1] * conv, reference, tau + lag, sigma, noise, self.cfg.TAIL_DOF).p_up
+            err = abs(p - mkt_up)
+            if err < best_err:
+                best_err, best_lag = err, lag
+        return best_err, best_lag
+
+    def _fill_diagnostics(self, ev: Evaluation) -> None:
+        """Market-implied sigma / moneyness and the lag match — computed only for rows that get logged."""
+        if ev.mkt_mid_up is None or ev.sigma_implied is not None or ev.x_implied is not None:
+            return
+        p = min(max(ev.mkt_mid_up, 1e-4), 1 - 1e-4)
+        ev.sigma_implied = implied_sigma(ev.spot_eff, ev.reference, ev.tau_s, p, ev.oracle_noise, self.cfg.TAIL_DOF)
+        ev.x_implied = implied_log_moneyness(ev.tau_s, ev.sigma, p, ev.oracle_noise, self.cfg.TAIL_DOF)
+        if ev.lag_err is None:
+            st = self.hub.assets.get(ev.window.asset)
+            if st is not None:
+                ev.lag_err, ev.lag_s = self._lag_match(st, ev.ts, ev.conv, ev.reference, ev.tau_s, ev.sigma,
+                                                       ev.oracle_noise, ev.p_up, ev.mkt_mid_up)
 
     # ------------------------------------------------------------------ logging policy
     def _maybe_snapshot(self, ev: Evaluation) -> None:
@@ -347,6 +407,7 @@ class SignalEngine:
         last = self._last_snapshot.get(ev.window.slug)
         if last is None or ev.ts - last >= interval:
             self._last_snapshot[ev.window.slug] = ev.ts
+            self._fill_diagnostics(ev)
             self.sink.snapshot(ev)
 
     def _maybe_log_signal(self, ev: Evaluation, force: bool = False) -> None:
@@ -360,6 +421,7 @@ class SignalEngine:
         self._last_logged[key] = (ev.ts, ev.best.edge_cons)
         if not ev.signal_id:
             ev.signal_id = self._new_signal_id(ev)
+        self._fill_diagnostics(ev)
         if ev.decision == SIGNAL:
             self.stats.signals += 1
         else:

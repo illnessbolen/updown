@@ -100,6 +100,39 @@ def calibration(snapshot_paths: List[str], outcomes: Dict[str, str]) -> dict:
     return res
 
 
+def model_vs_market(snapshot_paths: List[str]) -> dict:
+    """How the model's inputs compare with what the market's own prices imply.
+
+    sigma ratio  = sigma the market mid implies (with our spot and K) / our sigma. Well above 1:
+                   the market prices more uncertainty than we do -> our favourites look too cheap.
+    x gap        = our ln(S/K) - the ln(S/K) the market implies with our sigma, in bp. A persistent
+                   offset points at the reference price or the spot conversion, not at vol.
+    Rows with the market mid outside (0.05, 0.95) are skipped: there the tick size decides.
+    """
+    ratios: Dict[str, List[float]] = {}
+    gaps: List[float] = []
+    no_sigma = total = 0
+    for r in _rows(snapshot_paths):
+        sig, tau, mid = _num(r.get("sigma_bps")), _num(r.get("tau_s")), _num(r.get("mkt_mid_up"))
+        if sig is None or tau is None or mid is None or not 0.05 < mid < 0.95:
+            continue            # near 0/1 the implied values are set by the price tick, not the market
+        total += 1
+        si = _num(r.get("sigma_implied_bps"))
+        if si is None:
+            no_sigma += 1
+        elif sig > 0:
+            b = next(f"{lo}-{hi if math.isfinite(hi) else 'inf'}s" for lo, hi in TAU_BUCKETS if lo <= tau < hi)
+            ratios.setdefault(b, []).append(si / sig)
+        xi, x = _num(r.get("x_implied_bps")), _num(r.get("x_bps"))
+        if xi is not None and x is not None:
+            gaps.append(x - xi)
+    return {"rows": total, "no_implied_sigma": no_sigma,
+            "sigma_ratio_median": {k: statistics.median(v) for k, v in ratios.items()},
+            "sigma_ratio_n": {k: len(v) for k, v in ratios.items()},
+            "x_gap_median_bps": statistics.median(gaps) if gaps else None,
+            "x_gap_abs_median_bps": statistics.median(abs(g) for g in gaps) if gaps else None}
+
+
 def shadow_signals(signal_paths: List[str], outcomes: Dict[str, str],
                    decision: str = "SIGNAL") -> Tuple[dict, List[dict]]:
     first: Dict[Tuple[str, str], dict] = {}
@@ -200,6 +233,19 @@ def run(data_dir: str, out=print) -> dict:
     if w:
         out(w)
 
+    mvm = model_vs_market(snaps)
+    if mvm["rows"]:
+        out("\n-- model vs market (what the Polymarket mid implies) --")
+        out(f"rows={mvm['rows']} | mid not reachable by any sigma (market on the other side of 0.5): "
+            f"{mvm['no_implied_sigma']}")
+        for k, v in mvm["sigma_ratio_median"].items():
+            out(f"  tau {k:>11}: median sigma_market / sigma_model = {v:.2f} (n={mvm['sigma_ratio_n'][k]})")
+        if mvm["x_gap_median_bps"] is not None:
+            out(f"  our ln(S/K) minus market-implied: median {mvm['x_gap_median_bps']:+.2f} bp, "
+                f"median |gap| {mvm['x_gap_abs_median_bps']:.2f} bp")
+        out("  ratio >> 1: the market prices more uncertainty than the model; a steady x gap points at the "
+            "reference price or the spot conversion.")
+
     for res in (shadow, gated):
         out(f"\n-- shadow {res['decision']} (first per window/side, taker at logged ask+fee+slippage) --")
         out(f"logged={res['signals']} resolved={res['resolved']}")
@@ -248,4 +294,4 @@ def run(data_dir: str, out=print) -> dict:
             wr.writeheader()
             wr.writerows(resolved)
         out(f"\nper-signal outcomes -> {path}")
-    return {"calibration": cal, "signals": shadow, "gated": gated, "paper": paper}
+    return {"calibration": cal, "signals": shadow, "gated": gated, "paper": paper, "model_vs_market": mvm}

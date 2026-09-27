@@ -355,3 +355,49 @@ def test_discovery_aborts_the_round_when_gamma_is_unreachable():
     d = Discovery(cfg(ASSETS=("btc", "eth"), DETERMINISTIC_LABELS=("5m", "15m")), DownGamma(), ReplayClock(1790000130.0))
     assert d.refresh() == {}
     assert DownGamma.calls == 1          # one failed probe, no pile-up of retries, no scan
+
+
+# ---------------------------------------------------------------- multi-scale volatility
+def _msv(min_obs=20):
+    from latarb.model.volatility import MultiScaleVol
+    return MultiScaleVol(RealizedVol(1.0, 120, 1800, 100, 5.0), (10.0, 60.0), 3600.0, min_obs, 5.0)
+
+
+def test_multiscale_picks_the_scale_closest_to_the_horizon_and_waits_for_it():
+    rng = random.Random(1)
+    v = _msv()
+    px, t = 100.0, 0.0
+    while t < 700:                           # 700 s: 1 s and 10 s ready, 60 s has only 11 returns
+        t += 0.25
+        px *= math.exp(rng.gauss(0, 1e-4 * math.sqrt(0.25)))
+        v.update(t, px)
+    est, why = v.estimate(5.0, 120.0, 0.2)
+    assert why == "" and est.scale_s == 1.0
+    est, _ = v.estimate(45.0, 120.0, 0.2)
+    assert est.scale_s == 10.0 and est.lo < est.point < est.hi
+    assert v.estimate(90.0, 120.0, 0.2)[0].scale_s == 10.0          # 60 s not needed below 2 x 60 s
+    assert v.estimate(240.0, 120.0, 0.2) == (None, "vol_warmup_long")  # a 4-minute horizon needs it
+    while t < 1500:
+        t += 0.25
+        px *= math.exp(rng.gauss(0, 1e-4 * math.sqrt(0.25)))
+        v.update(t, px)
+    est, _ = v.estimate(240.0, 120.0, 0.2)
+    assert est.scale_s == 60.0 and 0.6e-4 < est.point < 1.5e-4
+
+
+def test_multiscale_sees_trending_moves_that_1s_returns_understate():
+    # a staircase: flat for 9 s, then a 3 bp step, always in the same direction within each minute.
+    # 1 s returns see rare jumps; 60 s returns see the full minute-scale drift of the path.
+    v = _msv(min_obs=10)
+    px, t, sign = 100.0, 0.0, 1
+    while t < 3000:
+        t += 1.0
+        if int(t) % 60 == 0:
+            sign = -sign
+        if int(t) % 10 == 0:
+            px *= math.exp(sign * 3e-4)
+        v.update(t, px)
+    sig = v.scale_sigmas()
+    assert sig[60.0] > 1.5 * sig[1.0]
+    est, _ = v.estimate(240.0, 120.0, 0.0)
+    assert est.point == pytest.approx(sig[60.0]) and est.hi >= sig[60.0] and est.lo <= sig[1.0] * 1.01

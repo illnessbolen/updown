@@ -32,35 +32,48 @@ def test_replay_finds_the_stale_book_after_a_spot_jump(tmp_path):
     summary = run_replay(cfg(), [str(tmp_path / "ticks")], str(out))
     assert summary["unparseable"] == 0
     rows = _signals(out / "signals.csv")
+    jump = synthetic.T0 + synthetic.JUMP_AT
+    # an efficient market (book tracks fair value) produces no signal before the jump
+    assert not [r for r in rows if float(r["ts"]) < jump]
     sig = [r for r in rows if r["decision"] == SIGNAL]
     assert sig, f"no signal; gates={summary['gates']} unpriced={summary['unpriced']}"
-    # the synthetic book never reprices, so random-walk drift before the jump can already be
-    # "mispriced" (either side); after the +25 bp jump every signal must be on Up
-    post = [r for r in sig if float(r["ts"]) >= synthetic.T0 + 201]
-    assert post and all(r["side"] == "up" for r in post)
-    first = post[0]
-    assert first["ref_source"] == "chainlink_rtds"
-    assert float(first["p_fair"]) > float(first["p_market"]) + 0.03
-    pre = [r for r in sig if float(r["ts"]) < synthetic.T0 + 200]
-    assert pre
-    for r in pre:                     # sigma is estimated, not assumed: true value is 1 bp/sqrt(s)
-        assert 0.8 < float(r["sigma_bps"]) < 1.2
-    # the jump itself is realized volatility: the fast estimator must react to it
-    assert float(first["sigma_bps"]) > max(float(r["sigma_bps"]) for r in pre)
+    assert all(r["side"] == "up" for r in sig)
+    first = sig[0]
+    assert first["ref_source"] == "chainlink_rtds" and first["oracle_proxy"] == "chainlink"
+    assert float(first["p_fair"]) > float(first["p_market"]) + 0.03 and float(first["x_bps"]) > 10
+    assert first["exec_status"] == ""
+    # the market never catches up: once the move is older than the longest lookback, the book no
+    # longer looks like a lagging copy of our model -> gated, not traded
+    assert all(float(r["ts"]) <= jump + 5.5 for r in sig)
+    late = [r for r in rows if float(r["ts"]) > jump + 6 and r["decision"] == GATED]
+    assert late and all("edge_not_latency" in r["reasons"] for r in late)
     # at the jump Coinbase has not ticked yet: gated as unconfirmed, then signalled once it confirms
-    at_jump = [r for r in rows if synthetic.T0 + 200 <= float(r["ts"]) < synthetic.T0 + 201 and r["side"] == "up"]
+    at_jump = [r for r in rows if jump <= float(r["ts"]) < jump + 1]
     assert at_jump[0]["decision"] == GATED and at_jump[0]["reasons"] == "sanity_unconfirmed"
-    confirmed = [r for r in sig if float(r["ts"]) >= synthetic.T0 + 200 and r["side"] == "up"][0]
-    assert 0 < float(confirmed["ts"]) - float(at_jump[0]["ts"]) <= 0.5
+    assert 0 < float(first["ts"]) - float(at_jump[0]["ts"]) <= 0.5
     assert not any("sanity_divergence" in r["reasons"] for r in rows)
-    assert first["oracle_proxy"] == "chainlink" and first["exec_status"] == ""
-    # the reference is the oracle price at the window start, in oracle units
-    assert float(first["x_bps"]) > 10
-    # every snapshot row of the window has a model probability
-    snaps = list((out).glob("snapshots-*.csv"))
-    assert snaps and all(r["p_fair_up"] for r in _signals(snaps[0]))
+    # sigma is estimated, not assumed (true 1 bp/sqrt(s)); the market (Gaussian, true sigma) implies
+    # about the same vol, and it is logged next to ours
+    snaps = _signals(next(out.glob("snapshots-*.csv")))
+    assert all(r["vol_scale_s"] for r in snaps)
     res = analyze.run(str(out), out=lambda *a: None)
     assert res["signals"]["resolved"] >= 1 and res["signals"]["wins"] >= 1
+
+
+def test_efficient_market_gives_no_signal_and_its_implied_vol_matches_ours(tmp_path):
+    # no jump: the book tracks the true fair value for the whole window
+    synthetic.write_session(tmp_path / "ticks", jump_bp=0.0)
+    out = tmp_path / "out"
+    run_replay(cfg(), [str(tmp_path / "ticks")], str(out))
+    assert not [r for r in _signals(out / "signals.csv") if r["decision"] == SIGNAL]
+    snaps = _signals(next(out.glob("snapshots-*.csv")))
+    assert all(0.8 < float(r["sigma_bps"]) < 1.3 for r in snaps)             # truth: 1 bp/sqrt(s)
+    # (the synthetic market clips at 0.03/0.97 and rounds to 1c: near the clip the implied vol is biased)
+    implied = sorted(float(r["sigma_implied_bps"]) for r in snaps
+                     if r["sigma_implied_bps"] and 0.1 < float(r["mkt_mid_up"]) < 0.9)
+    assert len(implied) >= 5 and 0.7 < implied[len(implied) // 2] < 1.4
+    rep = analyze.run(str(out), out=lambda *a: None)["model_vs_market"]
+    assert rep["x_gap_abs_median_bps"] < 2.0
 
 
 def test_coinbase_divergence_gates_the_whole_window(tmp_path):
@@ -68,7 +81,7 @@ def test_coinbase_divergence_gates_the_whole_window(tmp_path):
     out = tmp_path / "out"
     summary = run_replay(cfg(), [str(tmp_path / "ticks")], str(out))
     rows = _signals(out / "signals.csv")
-    glitch_from = synthetic.T0 + 195      # Coinbase prints +80 bp away from Binance from here on
+    glitch_from = synthetic.T0 + synthetic.JUMP_AT - 5   # Coinbase prints +80 bp away from here on
     after = [r for r in rows if float(r["ts"]) >= glitch_from + 0.5]
     assert after and not [r for r in after if r["decision"] == SIGNAL]
     assert all("sanity_divergence" in r["reasons"] for r in after)
@@ -95,8 +108,10 @@ class ListSink:
         self.snaps.append(ev)
 
 
-def _primed(c, *, up_book=(0.49, 0.51), down_book=(0.49, 0.51), spot=100_000.0, oracle_mult=1.0):
-    """Hub with a warmed-up vol estimator, oracle basis and a synced book, at T0 + 250."""
+def _primed(c, *, up_book=(0.49, 0.51), down_book=(0.49, 0.51), spot=100_000.0, oracle_mult=1.0, jump=0.002):
+    """Hub with a warmed-up vol estimator, oracle basis and a synced book, at T0 + 250.
+    Spot jumps +20 bp at T0 + 247: recent enough for the latency check (5 s lookback) to see
+    that the book still reflects the pre-jump price."""
     w = synthetic.window()
     clock = ReplayClock(w.start_ts - 400)
     hub = MarketDataHub(c, clock)
@@ -110,7 +125,7 @@ def _primed(c, *, up_book=(0.49, 0.51), down_book=(0.49, 0.51), spot=100_000.0, 
         t += 0.5
         k += 1
         clock.advance_to(t)
-        px = spot * (1 + (1e-5 if k % 2 else -1e-5)) if t < w.start_ts + 240 else spot * 1.002
+        px = spot * (1 + (1e-5 if k % 2 else -1e-5)) if t < w.start_ts + 247 else spot * (1 + jump)
         hub.apply_many([SpotQuote("binance", "btc", px - 0.5, px + 0.5, t),
                         SpotQuote("coinbase", "btc", px - 0.5, px + 0.5, t)])
         if abs(t - round(t)) < 1e-9:
@@ -163,3 +178,28 @@ def test_engine_refuses_to_price_without_reference():
     late = SignalEngine(c, hub, ReferenceResolver(c, hub), hub.clock, ListSink())   # a bot started late
     assert late.evaluate(w) is None
     assert late.stats.unpriced["reference_missing"] == 1
+
+
+def test_market_ahead_of_our_feed_is_not_a_latency_signal():
+    # the screenshot case: our spot is flat at K (P ~ 0.5) but the market already prices Up at 0.36,
+    # i.e. it knows about a drop our feed has not shown yet. Our model "sees" cheap Up; the market
+    # matches no recent version of the model, so this must not trade.
+    c = cfg(VOL_MIN_SAMPLES=100, BASIS_MIN_SAMPLES=10)
+    w, hub, eng, sink = _primed(c, up_book=(0.35, 0.37), down_book=(0.63, 0.65), jump=0.0)
+    ev = eng.evaluate(w)
+    assert ev.best.side == "up" and ev.best.edge_cons > c.EDGE_THRESHOLD
+    assert ev.decision == GATED and "edge_not_latency" in ev.reasons
+    assert ev.lag_err > c.LATENCY_MATCH_TOL
+    ok = eng.evaluate(w)                     # the gate can be switched off, and then it is a SIGNAL
+    eng.cfg = cfg(VOL_MIN_SAMPLES=100, BASIS_MIN_SAMPLES=10, REQUIRE_LATENCY_EXPLANATION=False)
+    assert eng.evaluate(w).decision == SIGNAL and ok.decision == GATED
+
+
+def test_market_mid_uses_the_complement_book():
+    from latarb.data.orderbook import OrderBook
+    from latarb.signal.engine import market_mid_up
+    up, dn = OrderBook("U"), OrderBook("D")
+    up.apply_snapshot([(0.40, 1)], [(0.60, 1)], 0)
+    dn.apply_snapshot([(0.55, 1)], [(0.62, 1)], 0)
+    mid, half = market_mid_up(up, dn)       # bid max(0.40, 1-0.62) = 0.40, ask min(0.60, 1-0.55) = 0.45
+    assert mid == pytest.approx(0.425) and half == pytest.approx(0.025)
