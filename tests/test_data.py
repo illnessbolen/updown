@@ -11,8 +11,8 @@ from latarb.config import load_settings
 from latarb.data.events import ASK, BID, BookLevel, BookSnapshot, OracleTick, SpotQuote, SpotTrade
 from latarb.data.gamma import Discovery
 from latarb.data.hub import MarketDataHub
-from latarb.data.markets import (BINANCE, CHAINLINK, UNKNOWN, MarketWindow, parse_slug, windows_from_event,
-                                 winner_from_market)
+from latarb.data.markets import (BINANCE, CHAINLINK, TWAP60_5M_SINCE_TS, TWAP_SINCE_TS, UNKNOWN, MarketWindow,
+                                 parse_slug, settlement_twap_s, windows_from_event, winner_from_market)
 from latarb.data.orderbook import OrderBook
 from latarb.data.parsers import (BinanceParser, CoinbaseParser, RtdsChainlinkParser, parse_iso_ts,
                                  parse_polymarket, parse_safely)
@@ -174,6 +174,35 @@ def test_daily_event_uses_gamma_end_date():
     assert w.end_ts - w.start_ts == 86400 and w.resolution == UNKNOWN
 
 
+def test_twap_rule_from_gamma():
+    def twap(**market):
+        return windows_from_event(_event("btc-updown-5m-1790000100", "2026-09-21T14:20:00Z", **market),
+                                  ["btc"])[0][0].twap_s
+
+    twap_src = "https://data.chain.link/streams/btc-usd-twap-60s-streams"
+    # as Gamma serves it (2026-10-03, btc-updown-5m-1791010500)
+    assert twap(resolutionSource=twap_src, cryptoMarketConfigId="btc-5m-twap-60", cryptoMarketConfig={
+        "id": "btc-5m-twap-60", "asset": "btc", "duration": "5m", "twapEnabled": True,
+        "twapLookbackSeconds": 60}) == 60
+    assert twap(cryptoMarketConfig=json.dumps({"twapEnabled": True, "twapLookbackSeconds": 30})) == 30
+    assert twap(resolutionSource=twap_src) == 60                     # no config: the stream named as source
+    assert twap(cryptoMarketConfig={"twapEnabled": False},
+                resolutionSource="https://data.chain.link/streams/btc-usd") == 0
+    assert twap(resolutionSource="https://data.chain.link/streams/btc-usd") is None
+
+
+def test_settlement_twap_from_the_schedule_when_gamma_does_not_say():
+    def rule(start, label="5m", duration_s=300, **kw):
+        return settlement_twap_s(_window(label=label, duration_s=duration_s, start_ts=start,
+                                         end_ts=start + duration_s, **kw))
+
+    assert rule(TWAP_SINCE_TS - 300) == 0                            # spot-settled before 2026-08-07
+    assert rule(TWAP_SINCE_TS) == 30 and rule(TWAP60_5M_SINCE_TS) == 60
+    assert rule(TWAP_SINCE_TS, label="15m", duration_s=900) == 60
+    assert rule(TWAP60_5M_SINCE_TS, twap_s=0.0) == 0                 # Gamma's rule wins over the dates
+    assert rule(TWAP60_5M_SINCE_TS, resolution=BINANCE) == 0
+
+
 def test_winner_detection():
     closed = {"closed": True, "outcomes": '["Up","Down"]', "outcomePrices": '["0","1"]'}
     assert winner_from_market(closed) == "down"
@@ -300,6 +329,35 @@ def test_chainlink_reference_missing_when_joined_late():
     w = _window()
     hub.apply_many([OracleTick("chainlink", "btc", 101.0, w.start_ts + 60, w.start_ts + 60)])
     assert ReferenceResolver(c, hub).get(w, w.start_ts + 61)[1] == "reference_missing"
+
+
+def test_chainlink_twap_reference_is_the_mean_of_the_lookback_before_the_start():
+    c = cfg(ASSETS=("btc",))
+    hub = MarketDataHub(c, ReplayClock())
+    w = _window(twap_s=60.0)
+    refs = ReferenceResolver(c, hub)
+    s = int(w.start_ts)
+    # price 100 + seconds since s - 70; the tick at s - 1 arrives late
+    hub.apply_many([OracleTick("chainlink", "btc", 100.0 + t - (s - 70), t, t + 0.3) for t in range(s - 70, s - 1)])
+    assert refs.get(w, w.start_ts + 0.5)[1] == "reference_pending"
+    hub.apply_many([OracleTick("chainlink", "btc", 169.0, s - 1, s + 0.6),
+                    OracleTick("chainlink", "btc", 170.0, s, s + 0.9)])
+    ref, why = refs.get(w, w.start_ts + 1.0)
+    assert why == "" and ref.source == "chainlink_twap" and ref.detail == "60s"
+    assert ref.price == pytest.approx(100.0 + (10 + 69) / 2)          # not the tick at the start (170)
+    hub.apply_many([OracleTick("chainlink", "btc", 500.0, s + 1, s + 1.2)])
+    assert refs.get(w, w.start_ts + 2.0)[0] is ref                    # cached for the window's life
+
+
+def test_chainlink_twap_reference_missing_when_the_lookback_is_not_covered():
+    c = cfg(ASSETS=("btc",))
+    hub = MarketDataHub(c, ReplayClock())
+    w = _window(twap_s=60.0)
+    s = int(w.start_ts)
+    hub.apply_many([OracleTick("chainlink", "btc", 100.0, t, t) for t in range(s - 30, s + 1)])   # joined late
+    assert ReferenceResolver(c, hub).get(w, w.start_ts + 1)[1] == "reference_missing"
+    known = _window(twap_s=60.0, price_to_beat=123.0)                 # Gamma's priceToBeat still comes first
+    assert ReferenceResolver(c, hub).get(known, w.start_ts + 1)[0].source == "gamma_price_to_beat"
 
 
 def test_binance_reference_from_trade_stream_then_kline():

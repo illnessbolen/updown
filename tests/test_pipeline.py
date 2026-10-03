@@ -172,6 +172,20 @@ def test_engine_gates_near_the_close_and_on_clock_skew():
     assert ev.decision == GATED and "min_time_left" in ev.reasons and "clock_skew" in ev.reasons
 
 
+def test_replay_prices_a_twap_window_against_the_twap_strike(tmp_path):
+    info = synthetic.write_session(tmp_path / "ticks", twap_s=60.0)
+    out = tmp_path / "out"
+    summary = run_replay(cfg(), [str(tmp_path / "ticks")], str(out))
+    rows = _signals(out / "signals.csv")
+    jump = synthetic.T0 + synthetic.JUMP_AT
+    # the market is priced against the TWAP strike: efficient until the jump, so nothing before it
+    assert not [r for r in rows if float(r["ts"]) < jump]
+    sig = [r for r in rows if r["decision"] == SIGNAL]
+    assert sig, f"no signal; gates={summary['gates']} unpriced={summary['unpriced']}"
+    assert {r["ref_source"] for r in rows} == {"chainlink_twap"}
+    assert float(sig[0]["reference"]) == pytest.approx(info["k_ref"], rel=1e-9)
+
+
 def test_engine_refuses_to_price_without_reference():
     c = cfg(VOL_MIN_SAMPLES=100, BASIS_MIN_SAMPLES=10, ORACLE_HISTORY_S=60)
     w, hub, _, _ = _primed(c)             # oracle history too short to still hold the start tick
