@@ -15,10 +15,12 @@ DUR = 300
 JUMP_AT = 30.0              # seconds into the window; early, while the market is still near 0.5
 
 
-def window() -> MarketWindow:
+def window(twap_s: float = 0.0) -> MarketWindow:
+    """twap_s = 0: settled on the Chainlink price at the start (the synthetic market prices against that tick);
+    > 0: settled on a TWAP, the price to beat being the TWAP of the twap_s seconds before the start."""
     return MarketWindow(slug=f"btc-updown-5m-{T0}", asset="btc", label="5m", duration_s=DUR,
                         start_ts=float(T0), end_ts=float(T0 + DUR), up_token="UP", down_token="DOWN",
-                        resolution=CHAINLINK)
+                        resolution=CHAINLINK, twap_s=twap_s)
 
 
 def _book(token, bid, ask, ts):
@@ -28,14 +30,16 @@ def _book(token, bid, ask, ts):
 
 
 def write_session(directory, *, seed=1, warmup_s=1500, jump_at=JUMP_AT, jump_bp=25.0,
-                  coinbase_glitch_bp=0.0, poly_pongs=True, poly_active=True, sigma=1e-4) -> dict:
+                  coinbase_glitch_bp=0.0, poly_pongs=True, poly_active=True, sigma=1e-4, twap_s=0.0) -> dict:
     """BTC session: vol warm-up, one 5m window. While the window runs, the Polymarket book tracks
     the true fair value (an efficient market); at T0+jump_at spot jumps and the book FREEZES at its
     pre-jump quote — the slow repricing the strategy looks for. With poly_active=False the book
-    never moves after its first snapshot (a dead market)."""
+    never moves after its first snapshot (a dead market). twap_s: see window(); the returned k_ref is the price
+    to beat the market is priced against."""
     rng = random.Random(seed)
     rec = TickRecorder(str(directory), rotate_s=3600)
-    w = window()
+    w = window(twap_s)
+    oracle = {}
     start = T0 - warmup_s
     for src in ("binance", "coinbase", "rtds", "polymarket"):
         rec.write(start, "@open", src)
@@ -67,8 +71,10 @@ def write_session(directory, *, seed=1, warmup_s=1500, jump_at=JUMP_AT, jump_bp=
         if t >= next_cl:
             sec = math.ceil(t)
             next_cl = sec + 1.0
+            oracle[sec] = px * math.exp(3e-4)
             if sec == T0:
-                k_ref = px * math.exp(3e-4)
+                lb = int(twap_s)
+                k_ref = sum(oracle[x] for x in range(T0 - lb, T0)) / lb if lb else oracle[sec]
             rec.write(t + 0.05, "rtds", json.dumps({
                 "topic": "crypto_prices_chainlink", "type": "update", "timestamp": int((t + 0.05) * 1000),
                 "payload": {"symbol": "btc/usd", "timestamp": int(sec * 1000), "value": px * math.exp(3e-4)}}))
@@ -91,4 +97,4 @@ def write_session(directory, *, seed=1, warmup_s=1500, jump_at=JUMP_AT, jump_bp=
             rec.write(t, "polymarket", "PONG")
     rec.write(T0 + DUR + 30, "@outcome", json.dumps({"slug": w.slug, "winner": "up", "window": w.to_dict()}))
     rec.close()
-    return {"window": w}
+    return {"window": w, "k_ref": k_ref}

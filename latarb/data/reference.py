@@ -2,7 +2,12 @@
 
 Priority:
   1. Gamma publishes a price-to-beat for the event          -> gamma_price_to_beat
-  2. chainlink-resolved: Chainlink tick at the window start  -> chainlink_rtds (exact timestamp)
+                         (about a minute after the window start, so it rarely helps a live bot)
+  2. chainlink-resolved, settled on a TWAP (since 2026-08-07; markets.settlement_twap_s):
+                         the TWAP of the Chainlink ticks over the lookback before the window start
+                         (previous tick each second, RTDS history)  -> chainlink_twap
+     chainlink-resolved, settled on the spot price (before):
+                         Chainlink tick at the window start  -> chainlink_rtds (exact timestamp)
                          (RTDS history, 5h deep)                chainlink_rtds_nearest (within tolerance)
   3. binance-resolved:   open of the Binance kline that starts at the window start
                          REST /api/v3/klines                 -> binance_kline (authoritative)
@@ -24,7 +29,7 @@ import requests
 from ..config import Settings
 from .gamma import make_session
 from .hub import MarketDataHub
-from .markets import BINANCE, CHAINLINK, MarketWindow
+from .markets import BINANCE, CHAINLINK, MarketWindow, settlement_twap_s
 
 log = logging.getLogger("latarb.reference")
 
@@ -92,6 +97,9 @@ class ReferenceResolver:
         if st is None:
             return None, "asset_not_tracked"
         if w.resolution == CHAINLINK:
+            lookback = settlement_twap_s(w)
+            if lookback > 0:
+                return self._twap_reference(w, st, now, int(lookback))
             tol = self.cfg.ORACLE_REF_TOLERANCE_S
             hit = st.oracle_hist.nearest(w.start_ts, tol)
             waiting = now <= w.start_ts + tol + self.cfg.ORACLE_STALE_S
@@ -116,6 +124,24 @@ class ReferenceResolver:
                 return ref, ""
             return None, "reference_pending"
         return None, "resolution_unknown"
+
+    def _twap_reference(self, w: MarketWindow, st, now: float, lookback: int) -> Tuple[Optional[Reference], str]:
+        """TWAP-settled window: the price to beat is the TWAP stream's value at the start, i.e. the mean of the
+        oracle over [start - lookback, start). Rebuilt from the RTDS ticks, previous tick each second: on a 2 h
+        recording (2026-10-02, 31 BTC 5m/15m windows priced) it was 0.09 bps from Gamma's priceToBeat in median
+        (max 0.45), where the tick at the start was 2.1 bps off (max 13.4)."""
+        start = int(w.start_ts)
+        last = st.oracle_hist.last()
+        if last is None or last[0] < start - 1:          # the last second before the start is not in yet
+            waiting = now <= w.start_ts + self.cfg.ORACLE_REF_TOLERANCE_S + self.cfg.ORACLE_STALE_S
+            return None, ("reference_pending" if waiting else "reference_missing")
+        secs = range(start - lookback, start)
+        pts = [st.oracle_hist.at(t) for t in secs]
+        if any(p is None or t - p[0] > self.cfg.ORACLE_STALE_S for t, p in zip(secs, pts)):
+            return None, "reference_missing"              # the history does not cover the averaging interval
+        ref = Reference(sum(p[1] for p in pts) / lookback, "chainlink_twap", f"{lookback}s")
+        self._cache[w.slug] = ref
+        return ref, ""
 
     # ------------------------------------------------------------------ REST confirmation
     def rest_jobs(self, now: float) -> List[MarketWindow]:

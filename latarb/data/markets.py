@@ -11,7 +11,9 @@ does not understand is reported as rejected instead of guessed):
 Token ids are mapped by OUTCOME NAME ("Up"/"Down"), never by list position.
 
 Resolution source (decides how the reference price is obtained):
-    chainlink   "price to beat" = Chainlink price at window start (5m/15m/4h families)
+    chainlink   5m/15m/4h families. Since 2026-08-07 they settle on a Chainlink TWAP (twap_s seconds,
+                Gamma's cryptoMarketConfig) and the "price to beat" is that TWAP at the window start;
+                before, the Chainlink price at the window start
     binance     Binance candle open -> close (hourly family: 1h BTC/USDT candle)
     unknown     discovered and logged, but never priced for trading
 """
@@ -56,6 +58,14 @@ RE_HOURLY = re.compile(
 RE_DAILY = re.compile(
     r"^(?P<asset>[a-z]+(?:-[a-z]+)?)-up-or-down-on-(?P<month>[a-z]+)-(?P<day>\d{1,2})(?:-(?P<year>\d{4}))?$")
 RE_UPDOWN_TEXT = re.compile(r"updown|up-or-down|up or down", re.I)
+RE_TWAP_SOURCE = re.compile(r"twap-(?P<s>\d+)s", re.I)     # data.chain.link/streams/btc-usd-twap-60s-streams
+
+# Polymarket moved the Chainlink-settled windows (5m/15m/4h) from the spot price to a TWAP on 2026-08-07
+# 00:00 UTC: 60 s, except 5m windows, which used 30 s until 2026-08-14 00:00 UTC. Since then Gamma states the
+# rule per market (cryptoMarketConfig); the dates only fill in windows that do not carry it, e.g. recordings
+# made before MarketWindow.twap_s existed.
+TWAP_SINCE_TS = 1786060800.0
+TWAP60_5M_SINCE_TS = 1786665600.0
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,7 @@ class MarketWindow:
     taker_fee_rate: Optional[float] = None     # None -> Settings.TAKER_FEE_RATE
     fee_exponent: Optional[float] = None       # None -> Settings.FEE_EXPONENT
     price_to_beat: Optional[float] = None      # only if Gamma publishes it
+    twap_s: Optional[float] = None             # Chainlink TWAP the window settles on; 0 = spot; None = unknown
     closed: bool = False
     accepting_orders: bool = True
     title: str = ""
@@ -210,6 +221,36 @@ def fee_schedule(market: dict) -> Tuple[Optional[float], Optional[float]]:
     return None, None
 
 
+def twap_lookback(market: dict, event: dict) -> Optional[float]:
+    """Seconds of the Chainlink TWAP the window settles on: Gamma's cryptoMarketConfig (twapEnabled,
+    twapLookbackSeconds), else the TWAP stream named as resolution source; 0 = spot; None = Gamma does not say."""
+    for obj in (market, event):
+        conf = _json_field(obj.get("cryptoMarketConfig"))
+        if isinstance(conf, dict) and "twapEnabled" in conf:
+            if not conf.get("twapEnabled"):
+                return 0.0
+            lookback = _pos_float(conf.get("twapLookbackSeconds"))
+            if lookback:
+                return lookback
+    for obj in (market, event):
+        m = RE_TWAP_SOURCE.search(str(obj.get("resolutionSource") or ""))
+        if m:
+            return float(m["s"])
+    return None
+
+
+def settlement_twap_s(w: MarketWindow) -> float:
+    """Seconds of the Chainlink TWAP the window settles on (0: the spot price). A window without the rule from
+    Gamma takes the published schedule (TWAP_SINCE_TS)."""
+    if w.resolution != CHAINLINK:
+        return 0.0
+    if w.twap_s is not None:
+        return w.twap_s
+    if w.start_ts < TWAP_SINCE_TS:
+        return 0.0
+    return 30.0 if (w.duration_s == 300 and w.start_ts < TWAP60_5M_SINCE_TS) else 60.0
+
+
 def price_to_beat(market: dict, event: dict) -> Optional[float]:
     for obj in (market, event):
         for key in ("eventMetadata", "metadata"):
@@ -273,6 +314,7 @@ def windows_from_event(event: dict, assets: Iterable[str],
             min_order_size=_pos_float(m.get("orderMinSize")) or 5.0,
             taker_fee_rate=rate, fee_exponent=exp,
             price_to_beat=price_to_beat(m, event),
+            twap_s=twap_lookback(m, event),
             closed=bool(m.get("closed", False)),
             accepting_orders=bool(m.get("acceptingOrders", True)),
             title=str(event.get("title") or m.get("question") or ""),
